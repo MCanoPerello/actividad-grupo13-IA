@@ -54,40 +54,48 @@ def preparar_dataset(df: pd.DataFrame, benchmark_df: pd.DataFrame) -> pd.DataFra
     data = data[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
     bench = bench[['Close']].rename(columns={'Close': 'Bench_Close'})
 
-    data['ret_1'] = data['Close'].pct_change(1)
-    data['ret_5'] = data['Close'].pct_change(5)
-    data['ret_10'] = data['Close'].pct_change(10)
-    data['ret_20'] = data['Close'].pct_change(20)
-    data['vol_chg_1'] = data['Volume'].pct_change(1)
-    data['vol_chg_5'] = data['Volume'].pct_change(5)
+    # Series "seguras" para evitar divisiones por cero
+    close_safe = data['Close'].replace(0, np.nan)
+    volume_safe = data['Volume'].replace(0, np.nan)
+    bench_close_safe = bench['Bench_Close'].replace(0, np.nan)
 
-    data['sma_5'] = data['Close'].rolling(5).mean()
-    data['sma_20'] = data['Close'].rolling(20).mean()
-    data['sma_ratio_5_20'] = data['sma_5'] / data['sma_20'] - 1
+    data['ret_1'] = close_safe.pct_change(1)
+    data['ret_5'] = close_safe.pct_change(5)
+    data['ret_10'] = close_safe.pct_change(10)
+    data['ret_20'] = close_safe.pct_change(20)
 
-    data['ema_12'] = data['Close'].ewm(span=12, adjust=False).mean()
-    data['ema_26'] = data['Close'].ewm(span=26, adjust=False).mean()
+    data['vol_chg_1'] = volume_safe.pct_change(1)
+    data['vol_chg_5'] = volume_safe.pct_change(5)
+
+    data['sma_5'] = close_safe.rolling(5).mean()
+    data['sma_20'] = close_safe.rolling(20).mean()
+    data['sma_ratio_5_20'] = data['sma_5'] / data['sma_20'].replace(0, np.nan) - 1
+
+    data['ema_12'] = close_safe.ewm(span=12, adjust=False).mean()
+    data['ema_26'] = close_safe.ewm(span=26, adjust=False).mean()
     data['macd'] = data['ema_12'] - data['ema_26']
     data['macd_signal'] = data['macd'].ewm(span=9, adjust=False).mean()
     data['macd_hist'] = data['macd'] - data['macd_signal']
 
-    data['rsi_14'] = rsi(data['Close'], 14)
+    data['rsi_14'] = rsi(close_safe, 14)
     data['volatility_10'] = data['ret_1'].rolling(10).std()
     data['volatility_20'] = data['ret_1'].rolling(20).std()
-    data['range_intraday'] = (data['High'] - data['Low']) / data['Close']
+    data['range_intraday'] = (data['High'] - data['Low']) / close_safe
 
-    bench['bench_ret_1'] = bench['Bench_Close'].pct_change(1)
-    bench['bench_ret_5'] = bench['Bench_Close'].pct_change(5)
-    bench['bench_ret_20'] = bench['Bench_Close'].pct_change(20)
+    bench['bench_ret_1'] = bench_close_safe.pct_change(1)
+    bench['bench_ret_5'] = bench_close_safe.pct_change(5)
+    bench['bench_ret_20'] = bench_close_safe.pct_change(20)
 
     data = data.join(bench[['bench_ret_1', 'bench_ret_5', 'bench_ret_20']], how='left')
 
-    data['target'] = (data['Close'].shift(-1) / data['Close'] - 1 > 0).astype(int)
-    data['next_return'] = data['Close'].shift(-1) / data['Close'] - 1
+    data['target'] = (close_safe.shift(-1) / close_safe - 1 > 0).astype(int)
+    data['next_return'] = close_safe.shift(-1) / close_safe - 1
+
+    # Clave: convertir infinitos en NaN antes de limpiar
+    data = data.replace([np.inf, -np.inf], np.nan)
 
     data = data.dropna().copy()
     return data
-
 
 def dividir_temporal(data: pd.DataFrame, train_pct: float = 0.8):
     corte = int(len(data) * train_pct)
@@ -211,6 +219,10 @@ if ejecutar:
         train, test = dividir_temporal(data, train_pct=train_pct)
         X_train, y_train = train[columnas_features], train['target']
         X_test, y_test = test[columnas_features], test['target']
+
+        # Comprobacion de seguridad: no debe haber infinitos
+X_train = X_train.replace([np.inf, -np.inf], np.nan)
+X_test = X_test.replace([np.inf, -np.inf], np.nan)
 
         logistic = Pipeline([
             ('imputer', SimpleImputer(strategy='median')),
