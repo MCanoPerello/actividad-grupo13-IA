@@ -1,36 +1,39 @@
 import warnings
-warnings.filterwarnings('ignore')
-
 from datetime import date
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from plotly.subplots import make_subplots
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
-    ConfusionMatrixDisplay,
     accuracy_score,
-    classification_report,
     confusion_matrix,
     f1_score,
     precision_score,
     recall_score,
     roc_auc_score,
+    roc_curve,
 )
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-import matplotlib.pyplot as plt
 
-st.set_page_config(page_title='Clasificacion de activos financieros', layout='wide')
+warnings.filterwarnings("ignore")
+
+st.set_page_config(page_title="Clasificacion de activos financieros", layout="wide")
 
 
 @st.cache_data(show_spinner=False)
-def descargar_datos(ticker: str, benchmark: str, inicio: str, fin: str):
+def descargar_datos(ticker: str, benchmark: str | None, inicio: str, fin: str):
     activo = yf.download(ticker, start=inicio, end=fin, auto_adjust=True, progress=False)
-    indice = yf.download(benchmark, start=inicio, end=fin, auto_adjust=True, progress=False)
+    indice = pd.DataFrame()
+    if benchmark:
+        indice = yf.download(benchmark, start=inicio, end=fin, auto_adjust=True, progress=False)
     return activo, indice
 
 
@@ -44,58 +47,73 @@ def rsi(series: pd.Series, periodo: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-def preparar_dataset(df: pd.DataFrame, benchmark_df: pd.DataFrame) -> pd.DataFrame:
+def preparar_dataset(df: pd.DataFrame, benchmark_df: pd.DataFrame | None = None, usar_benchmark: bool = True):
     data = df.copy()
-    bench = benchmark_df.copy()
-
     data.columns = [c[0] if isinstance(c, tuple) else c for c in data.columns]
-    bench.columns = [c[0] if isinstance(c, tuple) else c for c in bench.columns]
+    data = data[["Open", "High", "Low", "Close", "Volume"]].copy()
 
-    data = data[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-    bench = bench[['Close']].rename(columns={'Close': 'Bench_Close'})
+    close_safe = data["Close"].replace(0, np.nan)
+    volume_safe = data["Volume"].replace(0, np.nan)
 
-    # Series "seguras" para evitar divisiones por cero
-    close_safe = data['Close'].replace(0, np.nan)
-    volume_safe = data['Volume'].replace(0, np.nan)
-    bench_close_safe = bench['Bench_Close'].replace(0, np.nan)
+    data["ret_1"] = close_safe.pct_change(1)
+    data["ret_5"] = close_safe.pct_change(5)
+    data["ret_10"] = close_safe.pct_change(10)
+    data["ret_20"] = close_safe.pct_change(20)
+    data["vol_chg_1"] = volume_safe.pct_change(1)
+    data["vol_chg_5"] = volume_safe.pct_change(5)
 
-    data['ret_1'] = close_safe.pct_change(1)
-    data['ret_5'] = close_safe.pct_change(5)
-    data['ret_10'] = close_safe.pct_change(10)
-    data['ret_20'] = close_safe.pct_change(20)
+    data["sma_5"] = close_safe.rolling(5).mean()
+    data["sma_20"] = close_safe.rolling(20).mean()
+    data["sma_ratio_5_20"] = data["sma_5"] / data["sma_20"].replace(0, np.nan) - 1
 
-    data['vol_chg_1'] = volume_safe.pct_change(1)
-    data['vol_chg_5'] = volume_safe.pct_change(5)
+    data["ema_12"] = close_safe.ewm(span=12, adjust=False).mean()
+    data["ema_26"] = close_safe.ewm(span=26, adjust=False).mean()
+    data["macd"] = data["ema_12"] - data["ema_26"]
+    data["macd_signal"] = data["macd"].ewm(span=9, adjust=False).mean()
+    data["macd_hist"] = data["macd"] - data["macd_signal"]
 
-    data['sma_5'] = close_safe.rolling(5).mean()
-    data['sma_20'] = close_safe.rolling(20).mean()
-    data['sma_ratio_5_20'] = data['sma_5'] / data['sma_20'].replace(0, np.nan) - 1
+    data["rsi_14"] = rsi(close_safe, 14)
+    data["volatility_10"] = data["ret_1"].rolling(10).std()
+    data["volatility_20"] = data["ret_1"].rolling(20).std()
+    data["range_intraday"] = (data["High"] - data["Low"]) / close_safe
 
-    data['ema_12'] = close_safe.ewm(span=12, adjust=False).mean()
-    data['ema_26'] = close_safe.ewm(span=26, adjust=False).mean()
-    data['macd'] = data['ema_12'] - data['ema_26']
-    data['macd_signal'] = data['macd'].ewm(span=9, adjust=False).mean()
-    data['macd_hist'] = data['macd'] - data['macd_signal']
+    base_features = [
+        "ret_1",
+        "ret_5",
+        "ret_10",
+        "ret_20",
+        "vol_chg_1",
+        "vol_chg_5",
+        "sma_ratio_5_20",
+        "macd",
+        "macd_signal",
+        "macd_hist",
+        "rsi_14",
+        "volatility_10",
+        "volatility_20",
+        "range_intraday",
+    ]
 
-    data['rsi_14'] = rsi(close_safe, 14)
-    data['volatility_10'] = data['ret_1'].rolling(10).std()
-    data['volatility_20'] = data['ret_1'].rolling(20).std()
-    data['range_intraday'] = (data['High'] - data['Low']) / close_safe
+    benchmark_features = []
+    if usar_benchmark and benchmark_df is not None and not benchmark_df.empty:
+        bench = benchmark_df.copy()
+        bench.columns = [c[0] if isinstance(c, tuple) else c for c in bench.columns]
+        bench = bench[["Close"]].rename(columns={"Close": "Bench_Close"})
+        bench_close_safe = bench["Bench_Close"].replace(0, np.nan)
+        bench["bench_ret_1"] = bench_close_safe.pct_change(1)
+        bench["bench_ret_5"] = bench_close_safe.pct_change(5)
+        bench["bench_ret_20"] = bench_close_safe.pct_change(20)
+        data = data.join(bench[["bench_ret_1", "bench_ret_5", "bench_ret_20"]], how="left")
+        benchmark_features = ["bench_ret_1", "bench_ret_5", "bench_ret_20"]
 
-    bench['bench_ret_1'] = bench_close_safe.pct_change(1)
-    bench['bench_ret_5'] = bench_close_safe.pct_change(5)
-    bench['bench_ret_20'] = bench_close_safe.pct_change(20)
+    data["target"] = (close_safe.shift(-1) / close_safe - 1 > 0).astype(int)
+    data["next_return"] = close_safe.shift(-1) / close_safe - 1
 
-    data = data.join(bench[['bench_ret_1', 'bench_ret_5', 'bench_ret_20']], how='left')
-
-    data['target'] = (close_safe.shift(-1) / close_safe - 1 > 0).astype(int)
-    data['next_return'] = close_safe.shift(-1) / close_safe - 1
-
-    # Clave: convertir infinitos en NaN antes de limpiar
     data = data.replace([np.inf, -np.inf], np.nan)
+    feature_cols = base_features + benchmark_features
+    data = data.dropna(subset=feature_cols + ["target", "next_return", "Close", "sma_5", "sma_20"]).copy()
+    return data, feature_cols
 
-    data = data.dropna().copy()
-    return data
 
 def dividir_temporal(data: pd.DataFrame, train_pct: float = 0.8):
     corte = int(len(data) * train_pct)
@@ -104,91 +122,379 @@ def dividir_temporal(data: pd.DataFrame, train_pct: float = 0.8):
     return train, test
 
 
-def evaluar_modelo(nombre: str, modelo, X_train, y_train, X_test, y_test):
-    modelo.fit(X_train, y_train)
-    pred = modelo.predict(X_test)
+def filtrar_por_correlacion(X_train: pd.DataFrame, X_test: pd.DataFrame, threshold: float = 0.95):
+    corr = X_train.corr().abs()
+    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+    drop_cols = [column for column in upper.columns if any(upper[column] > threshold)]
+    keep_cols = [c for c in X_train.columns if c not in drop_cols]
+    return X_train[keep_cols].copy(), X_test[keep_cols].copy(), keep_cols, drop_cols
 
-    if hasattr(modelo, 'predict_proba'):
-        prob = modelo.predict_proba(X_test)[:, 1]
+
+def construir_modelos(random_state: int = 42):
+    logistic = Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            (
+                "clf",
+                LogisticRegression(
+                    max_iter=2000,
+                    class_weight="balanced",
+                    random_state=random_state,
+                ),
+            ),
+        ]
+    )
+
+    rf = Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            (
+                "clf",
+                RandomForestClassifier(
+                    n_estimators=300,
+                    max_depth=6,
+                    min_samples_leaf=5,
+                    class_weight="balanced_subsample",
+                    random_state=random_state,
+                ),
+            ),
+        ]
+    )
+    return logistic, rf
+
+
+def optimizar_modelo(nombre: str, modelo, X_train: pd.DataFrame, y_train: pd.Series, cv):
+    if nombre == "Regresion Logistica":
+        param_dist = {
+            "clf__C": [0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0],
+            "clf__solver": ["lbfgs", "liblinear"],
+        }
+        n_iter = 6
     else:
-        prob = None
+        param_dist = {
+            "clf__n_estimators": [150, 250, 350, 500],
+            "clf__max_depth": [4, 5, 6, 8, None],
+            "clf__min_samples_leaf": [2, 3, 5, 8, 12],
+            "clf__max_features": ["sqrt", "log2", None],
+        }
+        n_iter = 8
 
-    resultado = {
-        'Modelo': nombre,
-        'Accuracy': accuracy_score(y_test, pred),
-        'Precision': precision_score(y_test, pred, zero_division=0),
-        'Recall': recall_score(y_test, pred, zero_division=0),
-        'F1': f1_score(y_test, pred, zero_division=0),
-        'ROC_AUC': roc_auc_score(y_test, prob) if prob is not None and len(np.unique(y_test)) > 1 else np.nan,
-        'Matriz': confusion_matrix(y_test, pred),
-        'Predicciones': pred,
-        'Probabilidades': prob,
-        'Reporte': classification_report(y_test, pred, digits=4, zero_division=0),
-        'ModeloEntrenado': modelo,
+    search = RandomizedSearchCV(
+        estimator=modelo,
+        param_distributions=param_dist,
+        n_iter=n_iter,
+        scoring="roc_auc",
+        cv=cv,
+        random_state=42,
+        n_jobs=1,
+        refit=True,
+    )
+    search.fit(X_train, y_train)
+    return search.best_estimator_, search.best_params_, search.best_score_
+
+
+def evaluar_cv(nombre: str, modelo, X_train: pd.DataFrame, y_train: pd.Series, cv):
+    scoring = {
+        "accuracy": "accuracy",
+        "precision": "precision",
+        "recall": "recall",
+        "f1": "f1",
+        "roc_auc": "roc_auc",
     }
-    return resultado
+    res = cross_validate(modelo, X_train, y_train, cv=cv, scoring=scoring, n_jobs=1)
+    return {
+        "Modelo": nombre,
+        "CV_Accuracy_Media": np.nanmean(res["test_accuracy"]),
+        "CV_Accuracy_STD": np.nanstd(res["test_accuracy"]),
+        "CV_Precision_Media": np.nanmean(res["test_precision"]),
+        "CV_Recall_Media": np.nanmean(res["test_recall"]),
+        "CV_F1_Media": np.nanmean(res["test_f1"]),
+        "CV_ROC_AUC_Media": np.nanmean(res["test_roc_auc"]),
+    }
+
+
+def evaluar_modelo(nombre: str, modelo, X_train, y_train, X_test, y_test, threshold: float = 0.5):
+    modelo.fit(X_train, y_train)
+    prob = modelo.predict_proba(X_test)[:, 1]
+    pred = (prob >= threshold).astype(int)
+
+    roc_auc = roc_auc_score(y_test, prob) if len(np.unique(y_test)) > 1 else np.nan
+    fpr, tpr, _ = roc_curve(y_test, prob) if len(np.unique(y_test)) > 1 else (None, None, None)
+
+    return {
+        "Modelo": nombre,
+        "Accuracy": accuracy_score(y_test, pred),
+        "Precision": precision_score(y_test, pred, zero_division=0),
+        "Recall": recall_score(y_test, pred, zero_division=0),
+        "F1": f1_score(y_test, pred, zero_division=0),
+        "ROC_AUC": roc_auc,
+        "Matriz": confusion_matrix(y_test, pred),
+        "Predicciones": pred,
+        "Probabilidades": prob,
+        "ModeloEntrenado": modelo,
+        "FPR": fpr,
+        "TPR": tpr,
+        "Threshold": threshold,
+    }
 
 
 def importancia_random_forest(modelo, columnas):
-    estimador = modelo.named_steps['clf']
-    return pd.DataFrame(
-        {'Variable': columnas, 'Importancia': estimador.feature_importances_}
-    ).sort_values('Importancia', ascending=False)
+    estimador = modelo.named_steps["clf"]
+    df = pd.DataFrame({"Variable": columnas, "Importancia": estimador.feature_importances_})
+    return df.sort_values("Importancia", ascending=False).reset_index(drop=True)
+
 
 
 def coeficientes_logistic(modelo, columnas):
-    estimador = modelo.named_steps['clf']
-    return pd.DataFrame(
-        {'Variable': columnas, 'Coeficiente': estimador.coef_[0]}
-    ).assign(Abs=lambda x: x['Coeficiente'].abs()).sort_values('Abs', ascending=False)
+    estimador = modelo.named_steps["clf"]
+    df = pd.DataFrame({"Variable": columnas, "Coeficiente": estimador.coef_[0]})
+    df["Abs"] = df["Coeficiente"].abs()
+    return df.sort_values("Abs", ascending=False).reset_index(drop=True)
 
 
-def generar_interpretacion(metricas: pd.DataFrame, imp_rf: pd.DataFrame, coefs_log: pd.DataFrame) -> str:
-    ganador = metricas.sort_values(['F1', 'ROC_AUC', 'Accuracy'], ascending=False).iloc[0]
+def preparar_predicciones_test(test_df: pd.DataFrame, resultado_modelo: dict):
+    pred_df = pd.DataFrame(index=test_df.index)
+    pred_df["Close"] = test_df["Close"]
+    pred_df["Real"] = test_df["target"]
+    pred_df["Prob_Subida"] = resultado_modelo["Probabilidades"]
+    pred_df["Prediccion"] = resultado_modelo["Predicciones"]
+    pred_df["Next_Return"] = test_df["next_return"]
+    pred_df["Strategy_Return"] = np.where(pred_df["Prob_Subida"] >= resultado_modelo["Threshold"], pred_df["Next_Return"], 0.0)
+    pred_df["BuyHold_Return"] = pred_df["Next_Return"]
+    pred_df["Strategy_Cum"] = (1 + pred_df["Strategy_Return"].fillna(0)).cumprod()
+    pred_df["BuyHold_Cum"] = (1 + pred_df["BuyHold_Return"].fillna(0)).cumprod()
+    return pred_df
+
+
+def resumir_backtest(pred_df: pd.DataFrame):
+    estrategia_total = pred_df["Strategy_Cum"].iloc[-1] - 1
+    buyhold_total = pred_df["BuyHold_Cum"].iloc[-1] - 1
+    operado_pct = (pred_df["Strategy_Return"] != 0).mean()
+
+    strategy_std = pred_df["Strategy_Return"].std()
+    sharpe = np.nan
+    if strategy_std and strategy_std > 0:
+        sharpe = (pred_df["Strategy_Return"].mean() / strategy_std) * np.sqrt(252)
+
+    wealth = pred_df["Strategy_Cum"]
+    drawdown = wealth / wealth.cummax() - 1
+    max_drawdown = drawdown.min()
+
+    return {
+        "Rentabilidad estrategia": estrategia_total,
+        "Rentabilidad buy_hold": buyhold_total,
+        "Pct dias invertido": operado_pct,
+        "Sharpe simple": sharpe,
+        "Max drawdown": max_drawdown,
+    }
+
+
+def grafico_precio(data: pd.DataFrame, ticker: str, benchmark_df: pd.DataFrame | None, benchmark: str | None):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=data.index, y=data["Close"], mode="lines", name=f"{ticker} Close"))
+    fig.add_trace(go.Scatter(x=data.index, y=data["sma_5"], mode="lines", name="SMA 5"))
+    fig.add_trace(go.Scatter(x=data.index, y=data["sma_20"], mode="lines", name="SMA 20"))
+
+    if benchmark_df is not None and not benchmark_df.empty and benchmark:
+        bench = benchmark_df.copy()
+        bench.columns = [c[0] if isinstance(c, tuple) else c for c in bench.columns]
+        bench = bench[["Close"]].rename(columns={"Close": "Bench_Close"}).dropna()
+        if not bench.empty:
+            bench_norm = bench["Bench_Close"] / bench["Bench_Close"].iloc[0] * 100
+            activo_norm = data["Close"] / data["Close"].iloc[0] * 100
+            fig.add_trace(go.Scatter(x=data.index, y=activo_norm, mode="lines", name=f"{ticker} Base100", visible="legendonly"))
+            fig.add_trace(go.Scatter(x=bench.index, y=bench_norm, mode="lines", name=f"{benchmark} Base100", visible="legendonly"))
+
+    fig.update_layout(
+        title="Precio de cierre y medias móviles",
+        xaxis_title="Fecha",
+        yaxis_title="Precio",
+        hovermode="x unified",
+        height=500,
+    )
+    return fig
+
+
+def grafico_matriz_confusion(matriz: np.ndarray, titulo: str):
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=matriz,
+            x=["Predice 0", "Predice 1"],
+            y=["Real 0", "Real 1"],
+            text=matriz,
+            texttemplate="%{text}",
+            hovertemplate="%{y} / %{x}: %{z}<extra></extra>",
+        )
+    )
+    fig.update_layout(title=titulo, height=380)
+    return fig
+
+
+def grafico_roc(res_log: dict, res_rf: dict):
+    fig = go.Figure()
+    if res_log["FPR"] is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=res_log["FPR"],
+                y=res_log["TPR"],
+                mode="lines",
+                name=f"Regresion Logistica (AUC={res_log['ROC_AUC']:.3f})",
+            )
+        )
+    if res_rf["FPR"] is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=res_rf["FPR"],
+                y=res_rf["TPR"],
+                mode="lines",
+                name=f"Random Forest (AUC={res_rf['ROC_AUC']:.3f})",
+            )
+        )
+    fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Aleatorio", line=dict(dash="dash")))
+    fig.update_layout(
+        title="Curva ROC",
+        xaxis_title="False Positive Rate",
+        yaxis_title="True Positive Rate",
+        height=450,
+    )
+    return fig
+
+
+def grafico_probabilidad_vs_real(pred_df: pd.DataFrame, threshold: float, nombre_modelo: str):
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=pred_df.index,
+            y=pred_df["Prob_Subida"],
+            mode="lines",
+            name="Probabilidad predicha",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=pred_df.index,
+            y=pred_df["Real"],
+            mode="markers",
+            name="Resultado real (0/1)",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=pred_df.index,
+            y=np.repeat(threshold, len(pred_df)),
+            mode="lines",
+            name=f"Umbral {threshold:.2f}",
+            line=dict(dash="dash"),
+        )
+    )
+    fig.update_layout(
+        title=f"Probabilidad predicha vs resultado real - {nombre_modelo}",
+        xaxis_title="Fecha",
+        yaxis_title="Probabilidad / clase real",
+        yaxis=dict(range=[-0.05, 1.05]),
+        hovermode="x unified",
+        height=450,
+    )
+    return fig
+
+
+def grafico_backtest(pred_df: pd.DataFrame, nombre_modelo: str):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=pred_df.index, y=pred_df["Strategy_Cum"], mode="lines", name=f"Estrategia {nombre_modelo}"))
+    fig.add_trace(go.Scatter(x=pred_df.index, y=pred_df["BuyHold_Cum"], mode="lines", name="Buy & Hold"))
+    fig.update_layout(
+        title="Backtest simple: estrategia vs buy & hold",
+        xaxis_title="Fecha",
+        yaxis_title="Capital acumulado (base 1)",
+        hovermode="x unified",
+        height=450,
+    )
+    return fig
+
+
+def grafico_importancias(imp_rf: pd.DataFrame, coefs_log: pd.DataFrame):
+    fig = make_subplots(rows=1, cols=2, subplot_titles=("Random Forest", "Regresion Logistica"))
+    top_rf = imp_rf.head(10).sort_values("Importancia")
+    top_log = coefs_log.head(10).sort_values("Coeficiente")
+
+    fig.add_trace(
+        go.Bar(x=top_rf["Importancia"], y=top_rf["Variable"], orientation="h", name="RF"),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Bar(x=top_log["Coeficiente"], y=top_log["Variable"], orientation="h", name="Logit"),
+        row=1,
+        col=2,
+    )
+    fig.update_layout(title="Variables más relevantes", height=500, showlegend=False)
+    return fig
+
+
+def generar_interpretacion(metricas: pd.DataFrame, cv_metricas: pd.DataFrame, imp_rf: pd.DataFrame, coefs_log: pd.DataFrame, threshold: float, drop_cols: list[str]):
+    ganador = metricas.sort_values(["F1", "ROC_AUC", "Accuracy"], ascending=False).iloc[0]
+    ganador_cv = cv_metricas.sort_values(["CV_F1_Media", "CV_ROC_AUC_Media", "CV_Accuracy_Media"], ascending=False).iloc[0]
+
     texto = []
     texto.append(
-        f"El modelo con mejor equilibrio predictivo en el conjunto de prueba es {ganador['Modelo']}, "
-        f"con F1={ganador['F1']:.3f}, precision={ganador['Precision']:.3f}, recall={ganador['Recall']:.3f} "
-        f"y accuracy={ganador['Accuracy']:.3f}."
+        f"El mejor modelo en el test fuera de muestra es **{ganador['Modelo']}**, con F1={ganador['F1']:.3f}, "
+        f"precision={ganador['Precision']:.3f}, recall={ganador['Recall']:.3f}, accuracy={ganador['Accuracy']:.3f} "
+        f"y ROC-AUC={ganador['ROC_AUC']:.3f}."
     )
-
-    top_rf = ', '.join(imp_rf.head(5)['Variable'].tolist())
     texto.append(
-        f"En Random Forest, las variables más influyentes son: {top_rf}. "
-        "Eso sugiere que el modelo está captando sobre todo inercia reciente, tendencia y volatilidad."
+        f"En validación temporal interna, el modelo más estable también es **{ganador_cv['Modelo']}**, "
+        f"con F1 medio={ganador_cv['CV_F1_Media']:.3f} y ROC-AUC medio={ganador_cv['CV_ROC_AUC_Media']:.3f}."
     )
-
-    top_log_pos = coefs_log[coefs_log['Coeficiente'] > 0].head(3)['Variable'].tolist()
-    top_log_neg = coefs_log[coefs_log['Coeficiente'] < 0].head(3)['Variable'].tolist()
     texto.append(
-        f"En la Regresión Logística, las variables con efecto positivo más claro sobre la probabilidad de subida son: {', '.join(top_log_pos) if top_log_pos else 'ninguna dominante'}. "
-        f"Las que empujan hacia la clase de bajada son: {', '.join(top_log_neg) if top_log_neg else 'ninguna dominante'}."
+        f"El umbral operativo actual es **{threshold:.2f}**. Eso hace la señal más conservadora que el umbral clásico 0,50 "
+        "y ayuda a evitar operar cuando la convicción del modelo es baja."
     )
+
+    top_rf = ", ".join(imp_rf.head(5)["Variable"].tolist())
+    top_log_pos = coefs_log[coefs_log["Coeficiente"] > 0].head(3)["Variable"].tolist()
+    top_log_neg = coefs_log[coefs_log["Coeficiente"] < 0].head(3)["Variable"].tolist()
+    texto.append(
+        f"En Random Forest, las variables más influyentes son: {top_rf}. En la Regresión Logística, las variables con efecto positivo más claro "
+        f"sobre la probabilidad de subida son: {', '.join(top_log_pos) if top_log_pos else 'ninguna dominante'}; "
+        f"las que empujan hacia la clase de bajada son: {', '.join(top_log_neg) if top_log_neg else 'ninguna dominante'}."
+    )
+
+    if drop_cols:
+        texto.append(
+            f"El filtro de correlación ha eliminado {len(drop_cols)} variables redundantes: {', '.join(drop_cols)}. "
+            "Eso reduce ruido y riesgo de sobreajuste."
+        )
 
     texto.append(
-        "Desde una óptica financiera, este tipo de clasificación puede ser útil como filtro táctico de apoyo, "
-        "pero no debería tomarse como una señal autónoma de inversión. Conviene combinarla con control de costes, "
-        "gestión de riesgo y validación fuera de muestra."
+        "Desde una óptica financiera, el modelo debe interpretarse como una herramienta de apoyo táctico. "
+        "Puede ayudar a filtrar entradas, pero no sustituye la gestión del riesgo, los costes de transacción ni la validación continua fuera de muestra."
     )
-    return '\n\n'.join(texto)
+    return "\n\n".join(texto)
 
 
-st.title('Actividad 2 - Aprendizaje supervisado: clasificacion')
+st.title("Actividad 2 - Aprendizaje supervisado: clasificacion")
 st.markdown(
-    'App para descargar datos de mercado, construir variables tecnicas y comparar dos modelos de clasificacion: **Regresion Logistica** y **Random Forest**.'
+    "App para descargar datos de mercado, construir variables técnicas, aplicar selección de características y comparar **Regresión Logística** y **Random Forest** con validación temporal."
 )
 
 with st.sidebar:
-    st.header('Parametros')
-    ticker = st.text_input('Ticker del activo', value='SAN.MC')
-    benchmark = st.text_input('Ticker del indice de referencia', value='^IBEX')
-    inicio = st.date_input('Fecha inicio', value=date(2018, 1, 1))
-    fin = st.date_input('Fecha fin', value=date(2025, 12, 31))
-    train_pct = st.slider('Porcentaje para entrenamiento', min_value=0.6, max_value=0.9, value=0.8, step=0.05)
-    ejecutar = st.button('Ejecutar analisis', type='primary')
+    st.header("Parámetros")
+    ticker = st.text_input("Ticker del activo", value="SAN.MC")
+    usar_benchmark = st.checkbox("Usar benchmark", value=True)
+    benchmark = st.text_input("Ticker del índice de referencia", value="^IBEX") if usar_benchmark else None
+    inicio = st.date_input("Fecha inicio", value=date(2018, 1, 1))
+    fin = st.date_input("Fecha fin", value=date(2025, 12, 31))
+    train_pct = st.slider("Porcentaje para entrenamiento", min_value=0.60, max_value=0.90, value=0.80, step=0.05)
+    threshold = st.slider("Umbral para señal positiva", min_value=0.50, max_value=0.80, value=0.60, step=0.01)
+    aplicar_filtro_corr = st.checkbox("Aplicar filtro de correlación", value=True)
+    threshold_corr = st.slider("Umbral de correlación", min_value=0.80, max_value=0.99, value=0.95, step=0.01)
+    optimizar = st.checkbox("Optimizar hiperparámetros", value=True)
+    cv_splits = st.slider("Splits TimeSeriesSplit", min_value=3, max_value=6, value=4, step=1)
+    ejecutar = st.button("Ejecutar análisis", type="primary")
 
 st.info(
-    'La variable objetivo es binaria: 1 si la rentabilidad del siguiente periodo es positiva; 0 si es negativa o cero.'
+    "La variable objetivo es binaria: **1** si la rentabilidad del siguiente periodo es positiva y **0** si es negativa o cero. El modelo operativo usa un enfoque **long/cash**: entra si la probabilidad de subida supera el umbral y se queda fuera en caso contrario."
 )
 
 if ejecutar:
@@ -196,130 +502,220 @@ if ejecutar:
         activo, indice = descargar_datos(ticker, benchmark, str(inicio), str(fin))
 
         if activo.empty:
-            st.error('No se han descargado datos para el ticker del activo. Revisa el simbolo introducido.')
+            st.error("No se han descargado datos para el ticker del activo. Revisa el símbolo introducido.")
             st.stop()
-        if indice.empty:
-            st.error('No se han descargado datos para el indice de referencia. Revisa el simbolo introducido.')
-            st.stop()
-
-        data = preparar_dataset(activo, indice)
-
-        if len(data) < 120:
-            st.error('Hay muy pocas observaciones tras construir las variables. Amplia el rango temporal.')
+        if usar_benchmark and (indice is None or indice.empty):
+            st.error("No se han descargado datos para el benchmark. Revisa el símbolo o desactiva el benchmark.")
             st.stop()
 
-        columnas_features = [
-            'ret_1', 'ret_5', 'ret_10', 'ret_20',
-            'vol_chg_1', 'vol_chg_5',
-            'sma_ratio_5_20', 'macd', 'macd_signal', 'macd_hist',
-            'rsi_14', 'volatility_10', 'volatility_20', 'range_intraday',
-            'bench_ret_1', 'bench_ret_5', 'bench_ret_20'
-        ]
+        data, columnas_features = preparar_dataset(activo, indice, usar_benchmark=usar_benchmark)
+
+        if len(data) < 180:
+            st.error("Hay muy pocas observaciones tras construir las variables. Amplía el rango temporal.")
+            st.stop()
 
         train, test = dividir_temporal(data, train_pct=train_pct)
-        X_train, y_train = train[columnas_features], train['target']
-        X_test, y_test = test[columnas_features], test['target']
+        X_train, y_train = train[columnas_features], train["target"]
+        X_test, y_test = test[columnas_features], test["target"]
 
-        # Comprobacion de seguridad: no debe haber infinitos
         X_train = X_train.replace([np.inf, -np.inf], np.nan)
         X_test = X_test.replace([np.inf, -np.inf], np.nan)
 
-        logistic = Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),
-            ('scaler', StandardScaler()),
-            ('clf', LogisticRegression(max_iter=2000, class_weight='balanced')),
-        ])
+        dropped_features = []
+        if aplicar_filtro_corr:
+            X_train, X_test, columnas_finales, dropped_features = filtrar_por_correlacion(X_train, X_test, threshold=threshold_corr)
+        else:
+            columnas_finales = list(X_train.columns)
 
-        rf = Pipeline([
-            ('imputer', SimpleImputer(strategy='median')),
-            ('clf', RandomForestClassifier(
-                n_estimators=300,
-                max_depth=6,
-                min_samples_leaf=5,
-                random_state=42,
-                class_weight='balanced_subsample',
-            )),
-        ])
+        if len(columnas_finales) < 3:
+            st.error("La selección de variables ha dejado muy pocas features. Sube el umbral de correlación o desactiva el filtro.")
+            st.stop()
 
-        res_log = evaluar_modelo('Regresion Logistica', logistic, X_train, y_train, X_test, y_test)
-        res_rf = evaluar_modelo('Random Forest', rf, X_train, y_train, X_test, y_test)
+        logistic, rf = construir_modelos()
+        tscv = TimeSeriesSplit(n_splits=cv_splits)
 
-        metricas = pd.DataFrame([
-            {k: v for k, v in res_log.items() if k in ['Modelo', 'Accuracy', 'Precision', 'Recall', 'F1', 'ROC_AUC']},
-            {k: v for k, v in res_rf.items() if k in ['Modelo', 'Accuracy', 'Precision', 'Recall', 'F1', 'ROC_AUC']},
-        ])
+        mejores_params = []
+        if optimizar:
+            with st.spinner("Optimizando hiperparámetros..."):
+                logistic, best_params_log, best_score_log = optimizar_modelo("Regresion Logistica", logistic, X_train, y_train, tscv)
+                rf, best_params_rf, best_score_rf = optimizar_modelo("Random Forest", rf, X_train, y_train, tscv)
+                mejores_params = [
+                    {"Modelo": "Regresion Logistica", "Mejor ROC-AUC CV": best_score_log, "Parámetros": str(best_params_log)},
+                    {"Modelo": "Random Forest", "Mejor ROC-AUC CV": best_score_rf, "Parámetros": str(best_params_rf)},
+                ]
 
-        imp_rf = importancia_random_forest(res_rf['ModeloEntrenado'], columnas_features)
-        coefs_log = coeficientes_logistic(res_log['ModeloEntrenado'], columnas_features)
-        interpretacion = generar_interpretacion(metricas, imp_rf, coefs_log)
+        cv_log = evaluar_cv("Regresion Logistica", logistic, X_train, y_train, tscv)
+        cv_rf = evaluar_cv("Random Forest", rf, X_train, y_train, tscv)
+        cv_metricas = pd.DataFrame([cv_log, cv_rf])
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric('Observaciones totales', len(data))
-        c2.metric('Train', len(train))
-        c3.metric('Test', len(test))
+        res_log = evaluar_modelo("Regresion Logistica", logistic, X_train, y_train, X_test, y_test, threshold=threshold)
+        res_rf = evaluar_modelo("Random Forest", rf, X_train, y_train, X_test, y_test, threshold=threshold)
 
-        st.subheader('Resumen de datos')
-        resumen = pd.DataFrame({
-            'Periodo': [f"{data.index.min().date()} a {data.index.max().date()}"],
-            'Pct clase 1 (sube)': [round(data['target'].mean() * 100, 2)],
-            'Pct clase 0 (baja)': [round((1 - data['target'].mean()) * 100, 2)],
-        })
+        metricas = pd.DataFrame(
+            [
+                {k: v for k, v in res_log.items() if k in ["Modelo", "Accuracy", "Precision", "Recall", "F1", "ROC_AUC"]},
+                {k: v for k, v in res_rf.items() if k in ["Modelo", "Accuracy", "Precision", "Recall", "F1", "ROC_AUC"]},
+            ]
+        )
+
+        imp_rf = importancia_random_forest(res_rf["ModeloEntrenado"], columnas_finales)
+        coefs_log = coeficientes_logistic(res_log["ModeloEntrenado"], columnas_finales)
+        interpretacion = generar_interpretacion(metricas, cv_metricas, imp_rf, coefs_log, threshold, dropped_features)
+
+        pred_log = preparar_predicciones_test(test, res_log)
+        pred_rf = preparar_predicciones_test(test, res_rf)
+
+        mejor_modelo_nombre = metricas.sort_values(["F1", "ROC_AUC", "Accuracy"], ascending=False).iloc[0]["Modelo"]
+        pred_mejor = pred_log if mejor_modelo_nombre == "Regresion Logistica" else pred_rf
+        backtest_resumen = resumir_backtest(pred_mejor)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Observaciones totales", len(data))
+        c2.metric("Train", len(train))
+        c3.metric("Test", len(test))
+        c4.metric("Features finales", len(columnas_finales))
+
+        st.subheader("Resumen de datos")
+        resumen = pd.DataFrame(
+            {
+                "Activo": [ticker],
+                "Benchmark": [benchmark if usar_benchmark else "No usado"],
+                "Periodo": [f"{data.index.min().date()} a {data.index.max().date()}"],
+                "Pct clase 1 (sube)": [round(data["target"].mean() * 100, 2)],
+                "Pct clase 0 (baja)": [round((1 - data["target"].mean()) * 100, 2)],
+                "Fecha inicio test": [test.index.min().date()],
+                "Fecha fin test": [test.index.max().date()],
+            }
+        )
         st.dataframe(resumen, use_container_width=True)
 
-        st.subheader('Metricas de validacion')
-        st.dataframe(metricas.style.format({
-            'Accuracy': '{:.3f}', 'Precision': '{:.3f}', 'Recall': '{:.3f}', 'F1': '{:.3f}', 'ROC_AUC': '{:.3f}'
-        }), use_container_width=True)
+        st.subheader("Balance de clases")
+        balance = pd.DataFrame(
+            {
+                "Clase": ["0 = no sube", "1 = sube"],
+                "Observaciones": [int((data["target"] == 0).sum()), int((data["target"] == 1).sum())],
+            }
+        )
+        fig_balance = go.Figure(data=[go.Bar(x=balance["Clase"], y=balance["Observaciones"], text=balance["Observaciones"], textposition="outside")])
+        fig_balance.update_layout(height=350)
+        st.plotly_chart(fig_balance, use_container_width=True)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown('**Matriz de confusion - Regresion Logistica**')
-            fig1, ax1 = plt.subplots()
-            ConfusionMatrixDisplay(res_log['Matriz']).plot(ax=ax1, colorbar=False)
-            st.pyplot(fig1)
-            plt.close(fig1)
-        with col2:
-            st.markdown('**Matriz de confusion - Random Forest**')
-            fig2, ax2 = plt.subplots()
-            ConfusionMatrixDisplay(res_rf['Matriz']).plot(ax=ax2, colorbar=False)
-            st.pyplot(fig2)
-            plt.close(fig2)
+        st.subheader("Gráfico interactivo del activo")
+        st.plotly_chart(grafico_precio(data, ticker, indice if usar_benchmark else None, benchmark), use_container_width=True)
 
-        col3, col4 = st.columns(2)
-        with col3:
-            st.markdown('**Importancia de variables - Random Forest**')
-            st.dataframe(imp_rf.head(10), use_container_width=True)
-        with col4:
-            st.markdown('**Coeficientes - Regresion Logistica**')
-            st.dataframe(coefs_log[['Variable', 'Coeficiente']].head(10), use_container_width=True)
+        st.subheader("Selección de variables")
+        cols_fs1, cols_fs2 = st.columns([2, 1])
+        with cols_fs1:
+            st.dataframe(pd.DataFrame({"Variables finales": columnas_finales}), use_container_width=True)
+        with cols_fs2:
+            if dropped_features:
+                st.dataframe(pd.DataFrame({"Variables eliminadas": dropped_features}), use_container_width=True)
+            else:
+                st.success("No se eliminaron variables por correlación.")
 
-        st.subheader('Interpretacion automatica')
+        st.subheader("Métricas de validación en test")
+        st.dataframe(
+            metricas.style.format(
+                {
+                    "Accuracy": "{:.3f}",
+                    "Precision": "{:.3f}",
+                    "Recall": "{:.3f}",
+                    "F1": "{:.3f}",
+                    "ROC_AUC": "{:.3f}",
+                }
+            ),
+            use_container_width=True,
+        )
+
+        st.subheader("Validación temporal (TimeSeriesSplit)")
+        st.dataframe(
+            cv_metricas.style.format(
+                {
+                    "CV_Accuracy_Media": "{:.3f}",
+                    "CV_Accuracy_STD": "{:.3f}",
+                    "CV_Precision_Media": "{:.3f}",
+                    "CV_Recall_Media": "{:.3f}",
+                    "CV_F1_Media": "{:.3f}",
+                    "CV_ROC_AUC_Media": "{:.3f}",
+                }
+            ),
+            use_container_width=True,
+        )
+
+        if mejores_params:
+            st.subheader("Optimización de hiperparámetros")
+            st.dataframe(pd.DataFrame(mejores_params), use_container_width=True)
+
+        st.subheader("Matrices de confusión")
+        col_conf1, col_conf2 = st.columns(2)
+        with col_conf1:
+            st.plotly_chart(grafico_matriz_confusion(res_log["Matriz"], "Regresión Logística"), use_container_width=True)
+        with col_conf2:
+            st.plotly_chart(grafico_matriz_confusion(res_rf["Matriz"], "Random Forest"), use_container_width=True)
+
+        st.subheader("Curva ROC")
+        st.plotly_chart(grafico_roc(res_log, res_rf), use_container_width=True)
+
+        st.subheader("Probabilidad predicha vs resultado real")
+        modelo_vista = st.radio("Modelo para visualizar", options=["Regresion Logistica", "Random Forest"], horizontal=True)
+        pred_vista = pred_log if modelo_vista == "Regresion Logistica" else pred_rf
+        st.plotly_chart(grafico_probabilidad_vs_real(pred_vista, threshold, modelo_vista), use_container_width=True)
+
+        st.subheader("Importancia de variables y coeficientes")
+        st.plotly_chart(grafico_importancias(imp_rf, coefs_log), use_container_width=True)
+
+        st.subheader("Backtest simple")
+        bt_col1, bt_col2, bt_col3, bt_col4, bt_col5 = st.columns(5)
+        bt_col1.metric("Modelo usado", mejor_modelo_nombre)
+        bt_col2.metric("Rent. estrategia", f"{backtest_resumen['Rentabilidad estrategia'] * 100:.2f}%")
+        bt_col3.metric("Rent. buy&hold", f"{backtest_resumen['Rentabilidad buy_hold'] * 100:.2f}%")
+        bt_col4.metric("Sharpe simple", f"{backtest_resumen['Sharpe simple']:.2f}" if pd.notna(backtest_resumen['Sharpe simple']) else "n.d.")
+        bt_col5.metric("Max drawdown", f"{backtest_resumen['Max drawdown'] * 100:.2f}%")
+
+        st.plotly_chart(grafico_backtest(pred_mejor, mejor_modelo_nombre), use_container_width=True)
+
+        st.subheader("Interpretación automática")
         st.write(interpretacion)
 
-        st.subheader('Anexo tecnico para el informe')
+        st.subheader("Anexo técnico para el informe")
         st.markdown(
             f"""
-            - **Activo analizado:** `{ticker}`
-            - **Indice de referencia:** `{benchmark}`
-            - **Variable objetivo:** 1 si la rentabilidad de `t+1` es positiva, 0 en caso contrario.
-            - **Separacion temporal:** {int(train_pct * 100)}% entrenamiento / {int((1 - train_pct) * 100)}% prueba.
-            - **Modelos aplicados:** Regresion Logistica y Random Forest.
-            - **Variables explicativas:** rentabilidades rezagadas, cambios de volumen, SMA ratio, MACD, RSI, volatilidad y retornos del indice.
+- **Activo analizado:** `{ticker}`
+- **Benchmark:** `{benchmark if usar_benchmark else 'No utilizado'}`
+- **Variable objetivo:** 1 si la rentabilidad de `t+1` es positiva; 0 si es negativa o cero.
+- **Separación temporal:** {int(train_pct * 100)}% entrenamiento / {int((1 - train_pct) * 100)}% prueba.
+- **Validación interna:** TimeSeriesSplit con {cv_splits} particiones.
+- **Umbral operativo:** {threshold:.2f}.
+- **Modelos aplicados:** Regresión Logística y Random Forest.
+- **Selección de variables:** {'Sí, filtro de correlación' if aplicar_filtro_corr else 'No aplicada'}.
+- **Optimización de hiperparámetros:** {'Sí' if optimizar else 'No'}.
+- **Variables explicativas usadas:** {', '.join(columnas_finales)}.
             """
         )
 
-        csv_metricas = metricas.to_csv(index=False).encode('utf-8')
-        st.download_button('Descargar metricas CSV', csv_metricas, file_name='metricas_modelos.csv', mime='text/csv')
+        export_metricas = metricas.merge(cv_metricas, on="Modelo", how="left")
+        export_metricas.to_csv(index=False).encode("utf-8")
+
+        csv_metricas = export_metricas.to_csv(index=False).encode("utf-8")
+        csv_pred_mejor = pred_mejor.reset_index().rename(columns={"index": "Date"}).to_csv(index=False).encode("utf-8")
+        csv_imp = imp_rf.to_csv(index=False).encode("utf-8")
+        csv_coef = coefs_log.to_csv(index=False).encode("utf-8")
+
+        dl1, dl2, dl3, dl4 = st.columns(4)
+        dl1.download_button("Descargar métricas CSV", csv_metricas, file_name="metricas_modelos.csv", mime="text/csv")
+        dl2.download_button("Descargar predicciones CSV", csv_pred_mejor, file_name="predicciones_mejor_modelo.csv", mime="text/csv")
+        dl3.download_button("Descargar importancias RF", csv_imp, file_name="importancias_random_forest.csv", mime="text/csv")
+        dl4.download_button("Descargar coeficientes logit", csv_coef, file_name="coeficientes_logistica.csv", mime="text/csv")
 
     except Exception as e:
         st.exception(e)
 else:
     st.markdown(
         """
-        ### Recomendacion para tu entrega
-        1. Ejecuta varios tickers del IBEX 35 o del mercado que elijas.
-        2. Escoge el caso con resultados mas coherentes y defendibles.
-        3. Copia las metricas, la matriz de confusion y las variables mas relevantes en el informe.
-        4. Añade una interpretacion critica: utilidad como apoyo tactico, pero no como sistema autonomo de trading.
+### Recomendación de uso
+1. Ejecuta varios tickers del IBEX 35 o del mercado que elijas.
+2. Compara métricas, curva ROC e interpretación de variables.
+3. Usa la gráfica de probabilidad predicha vs resultado real para explicar cuándo el modelo acierta o se equivoca.
+4. Usa el backtest simple solo como apoyo ilustrativo, no como prueba definitiva de rentabilidad.
         """
     )
