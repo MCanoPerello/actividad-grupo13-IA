@@ -221,8 +221,8 @@ if ejecutar:
         X_test, y_test = test[columnas_features], test['target']
 
         # Comprobacion de seguridad: no debe haber infinitos
-X_train = X_train.replace([np.inf, -np.inf], np.nan)
-X_test = X_test.replace([np.inf, -np.inf], np.nan)
+        X_train = X_train.replace([np.inf, -np.inf], np.nan)
+        X_test = X_test.replace([np.inf, -np.inf], np.nan)
 
         logistic = Pipeline([
             ('imputer', SimpleImputer(strategy='median')),
