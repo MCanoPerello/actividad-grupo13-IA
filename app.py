@@ -299,21 +299,31 @@ def resumir_backtest(pred_df: pd.DataFrame, periods_per_year: int):
     buyhold_total = pred_df["BuyHold_Cum"].iloc[-1] - 1
     operado_pct = (pred_df["Strategy_Return"] != 0).mean()
 
-    strategy_std = pred_df["Strategy_Return"].std()
-    sharpe = np.nan
-    if strategy_std and strategy_std > 0:
-        sharpe = (pred_df["Strategy_Return"].mean() / strategy_std) * np.sqrt(periods_per_year)
+    def calc_sharpe(returns: pd.Series):
+        returns = returns.fillna(0)
+        std = returns.std()
+        if pd.notna(std) and std > 0:
+            return (returns.mean() / std) * np.sqrt(periods_per_year)
+        return np.nan
 
-    wealth = pred_df["Strategy_Cum"]
-    drawdown = wealth / wealth.cummax() - 1
-    max_drawdown = drawdown.min()
+    def calc_max_drawdown(cum_series: pd.Series):
+        drawdown = cum_series / cum_series.cummax() - 1
+        return drawdown.min()
+
+    sharpe_estrategia = calc_sharpe(pred_df["Strategy_Return"])
+    sharpe_buyhold = calc_sharpe(pred_df["BuyHold_Return"])
+
+    max_drawdown_estrategia = calc_max_drawdown(pred_df["Strategy_Cum"])
+    max_drawdown_buyhold = calc_max_drawdown(pred_df["BuyHold_Cum"])
 
     return {
         "Rentabilidad estrategia": estrategia_total,
         "Rentabilidad buy_hold": buyhold_total,
         "Pct periodos invertido": operado_pct,
-        "Sharpe simple": sharpe,
-        "Max drawdown": max_drawdown,
+        "Sharpe estrategia": sharpe_estrategia,
+        "Sharpe buy_hold": sharpe_buyhold,
+        "Max drawdown estrategia": max_drawdown_estrategia,
+        "Max drawdown buy_hold": max_drawdown_buyhold,
     }
 
 
@@ -906,13 +916,38 @@ if results is not None:
     st.plotly_chart(grafico_importancias(imp_rf, coefs_log), use_container_width=True)
 
     st.subheader("Backtest simple")
-    bt_col1, bt_col2, bt_col3, bt_col4, bt_col5 = st.columns(5)
-    bt_col1.metric("Modelo usado", mejor_modelo_nombre)
-    bt_col2.metric("Rent. estrategia", f"{backtest_resumen['Rentabilidad estrategia'] * 100:.2f}%")
-    bt_col3.metric("Rent. buy&hold", f"{backtest_resumen['Rentabilidad buy_hold'] * 100:.2f}%")
-    bt_col4.metric("Sharpe simple", f"{backtest_resumen['Sharpe simple']:.2f}" if pd.notna(backtest_resumen['Sharpe simple']) else "n.d.")
-    bt_col5.metric("Max drawdown", f"{backtest_resumen['Max drawdown'] * 100:.2f}%")
+
+    bt_row1_col1, bt_row1_col2, bt_row1_col3 = st.columns(3)
+    bt_row1_col1.metric("Modelo usado", mejor_modelo_nombre)
+    bt_row1_col2.metric("Rent. estrategia", f"{backtest_resumen['Rentabilidad estrategia'] * 100:.2f}%")
+    bt_row1_col3.metric("Rent. buy&hold", f"{backtest_resumen['Rentabilidad buy_hold'] * 100:.2f}%")
+    
+    bt_row2_col1, bt_row2_col2 = st.columns(2)
+    bt_row2_col1.metric(
+        "Sharpe estrategia",
+        f"{backtest_resumen['Sharpe estrategia']:.2f}" if pd.notna(backtest_resumen['Sharpe estrategia']) else "n.d."
+    )
+    bt_row2_col2.metric(
+        "Sharpe buy&hold",
+        f"{backtest_resumen['Sharpe buy_hold']:.2f}" if pd.notna(backtest_resumen['Sharpe buy_hold']) else "n.d."
+    )
+    
+    bt_row3_col1, bt_row3_col2 = st.columns(2)
+    bt_row3_col1.metric(
+        "Max drawdown estrategia",
+        f"{backtest_resumen['Max drawdown estrategia'] * 100:.2f}%"
+    )
+    bt_row3_col2.metric(
+        "Max drawdown buy&hold",
+        f"{backtest_resumen['Max drawdown buy_hold'] * 100:.2f}%"
+    )
+    
     st.caption(f"Porcentaje de periodos invertido: {backtest_resumen['Pct periodos invertido']:.1%}")
+    
+    
+    
+    
+    
     st.plotly_chart(grafico_backtest(pred_mejor, mejor_modelo_nombre), use_container_width=True)
 
     st.subheader("Interpretación automática")
