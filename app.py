@@ -27,13 +27,39 @@ warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Clasificacion de activos financieros", layout="wide")
 
+FREQUENCY_CONFIG = {
+    "Diaria": {"interval": "1d", "periods_per_year": 252, "label": "diaria"},
+    "Semanal": {"interval": "1wk", "periods_per_year": 52, "label": "semanal"},
+    "Mensual": {"interval": "1mo", "periods_per_year": 12, "label": "mensual"},
+}
+
+VARIABLE_DEFINITIONS = {
+    "ret_1": "Rentabilidad del último periodo. Mide el impulso más reciente del precio.",
+    "ret_5": "Rentabilidad acumulada de los últimos 5 periodos. Resume momentum de corto plazo.",
+    "ret_10": "Rentabilidad acumulada de los últimos 10 periodos. Captura tendencia intermedia.",
+    "ret_20": "Rentabilidad acumulada de los últimos 20 periodos. Refleja sesgo más persistente.",
+    "vol_chg_1": "Cambio porcentual del volumen frente al periodo anterior. Señala aceleración o pérdida de interés.",
+    "vol_chg_5": "Cambio porcentual del volumen frente a 5 periodos atrás. Mide confirmación de actividad.",
+    "sma_ratio_5_20": "Relación entre media móvil corta y larga. Positivo suele indicar sesgo alcista reciente.",
+    "macd": "Diferencia entre EMA 12 y EMA 26. Mide momentum tendencial.",
+    "macd_signal": "Media exponencial del MACD. Se usa como referencia para cruces de señal.",
+    "macd_hist": "Diferencia entre MACD y su señal. Mide fuerza de aceleración del momentum.",
+    "rsi_14": "Índice de fuerza relativa a 14 periodos. Evalúa presión compradora o vendedora.",
+    "volatility_10": "Desviación típica de retornos a 10 periodos. Aproxima volatilidad reciente.",
+    "volatility_20": "Desviación típica de retornos a 20 periodos. Refleja riesgo algo más estable.",
+    "range_intraday": "Amplitud relativa entre máximo y mínimo del periodo. Mide rango de negociación.",
+    "bench_ret_1": "Rentabilidad del benchmark en el último periodo. Aporta contexto de mercado.",
+    "bench_ret_5": "Rentabilidad del benchmark a 5 periodos. Resume momentum del índice.",
+    "bench_ret_20": "Rentabilidad del benchmark a 20 periodos. Captura tendencia más amplia del mercado.",
+}
+
 
 @st.cache_data(show_spinner=False)
-def descargar_datos(ticker: str, benchmark: str | None, inicio: str, fin: str):
-    activo = yf.download(ticker, start=inicio, end=fin, auto_adjust=True, progress=False)
+def descargar_datos(ticker: str, benchmark: str | None, inicio: str, fin: str, interval: str):
+    activo = yf.download(ticker, start=inicio, end=fin, interval=interval, auto_adjust=True, progress=False)
     indice = pd.DataFrame()
     if benchmark:
-        indice = yf.download(benchmark, start=inicio, end=fin, auto_adjust=True, progress=False)
+        indice = yf.download(benchmark, start=inicio, end=fin, interval=interval, auto_adjust=True, progress=False)
     return activo, indice
 
 
@@ -221,6 +247,7 @@ def evaluar_modelo(nombre: str, modelo, X_train, y_train, X_test, y_test, thresh
 
     roc_auc = roc_auc_score(y_test, prob) if len(np.unique(y_test)) > 1 else np.nan
     fpr, tpr, _ = roc_curve(y_test, prob) if len(np.unique(y_test)) > 1 else (None, None, None)
+    matriz = confusion_matrix(y_test, pred, labels=[0, 1])
 
     return {
         "Modelo": nombre,
@@ -229,13 +256,14 @@ def evaluar_modelo(nombre: str, modelo, X_train, y_train, X_test, y_test, thresh
         "Recall": recall_score(y_test, pred, zero_division=0),
         "F1": f1_score(y_test, pred, zero_division=0),
         "ROC_AUC": roc_auc,
-        "Matriz": confusion_matrix(y_test, pred),
+        "Matriz": matriz,
         "Predicciones": pred,
         "Probabilidades": prob,
         "ModeloEntrenado": modelo,
         "FPR": fpr,
         "TPR": tpr,
         "Threshold": threshold,
+        "Pct_Predice_1": float(np.mean(pred)),
     }
 
 
@@ -243,7 +271,6 @@ def importancia_random_forest(modelo, columnas):
     estimador = modelo.named_steps["clf"]
     df = pd.DataFrame({"Variable": columnas, "Importancia": estimador.feature_importances_})
     return df.sort_values("Importancia", ascending=False).reset_index(drop=True)
-
 
 
 def coeficientes_logistic(modelo, columnas):
@@ -267,7 +294,7 @@ def preparar_predicciones_test(test_df: pd.DataFrame, resultado_modelo: dict):
     return pred_df
 
 
-def resumir_backtest(pred_df: pd.DataFrame):
+def resumir_backtest(pred_df: pd.DataFrame, periods_per_year: int):
     estrategia_total = pred_df["Strategy_Cum"].iloc[-1] - 1
     buyhold_total = pred_df["BuyHold_Cum"].iloc[-1] - 1
     operado_pct = (pred_df["Strategy_Return"] != 0).mean()
@@ -275,7 +302,7 @@ def resumir_backtest(pred_df: pd.DataFrame):
     strategy_std = pred_df["Strategy_Return"].std()
     sharpe = np.nan
     if strategy_std and strategy_std > 0:
-        sharpe = (pred_df["Strategy_Return"].mean() / strategy_std) * np.sqrt(252)
+        sharpe = (pred_df["Strategy_Return"].mean() / strategy_std) * np.sqrt(periods_per_year)
 
     wealth = pred_df["Strategy_Cum"]
     drawdown = wealth / wealth.cummax() - 1
@@ -284,7 +311,7 @@ def resumir_backtest(pred_df: pd.DataFrame):
     return {
         "Rentabilidad estrategia": estrategia_total,
         "Rentabilidad buy_hold": buyhold_total,
-        "Pct dias invertido": operado_pct,
+        "Pct periodos invertido": operado_pct,
         "Sharpe simple": sharpe,
         "Max drawdown": max_drawdown,
     }
@@ -327,7 +354,7 @@ def grafico_matriz_confusion(matriz: np.ndarray, titulo: str):
             hovertemplate="%{y} / %{x}: %{z}<extra></extra>",
         )
     )
-    fig.update_layout(title=titulo, height=380)
+    fig.update_layout(title=titulo, height=380, yaxis=dict(autorange="reversed"))
     return fig
 
 
@@ -371,12 +398,26 @@ def grafico_probabilidad_vs_real(pred_df: pd.DataFrame, threshold: float, nombre
             name="Probabilidad predicha",
         )
     )
+
+    reales_sube = pred_df[pred_df["Real"] == 1]
+    reales_no_sube = pred_df[pred_df["Real"] == 0]
+
     fig.add_trace(
         go.Scatter(
-            x=pred_df.index,
-            y=pred_df["Real"],
+            x=reales_sube.index,
+            y=reales_sube["Real"],
             mode="markers",
-            name="Resultado real (0/1)",
+            name="Real = 1 (sube)",
+            marker=dict(symbol="circle", size=7),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=reales_no_sube.index,
+            y=reales_no_sube["Real"],
+            mode="markers",
+            name="Real = 0 (no sube)",
+            marker=dict(symbol="x", size=7),
         )
     )
     fig.add_trace(
@@ -395,6 +436,20 @@ def grafico_probabilidad_vs_real(pred_df: pd.DataFrame, threshold: float, nombre
         yaxis=dict(range=[-0.05, 1.05]),
         hovermode="x unified",
         height=450,
+    )
+    return fig
+
+
+def grafico_distribucion_probabilidades(pred_log: pd.DataFrame, pred_rf: pd.DataFrame):
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(x=pred_log["Prob_Subida"], nbinsx=25, name="Regresion Logistica", opacity=0.65))
+    fig.add_trace(go.Histogram(x=pred_rf["Prob_Subida"], nbinsx=25, name="Random Forest", opacity=0.65))
+    fig.update_layout(
+        title="Distribución de probabilidades predichas",
+        xaxis_title="Probabilidad de subida",
+        yaxis_title="Frecuencia",
+        barmode="overlay",
+        height=420,
     )
     return fig
 
@@ -432,45 +487,242 @@ def grafico_importancias(imp_rf: pd.DataFrame, coefs_log: pd.DataFrame):
     return fig
 
 
-def generar_interpretacion(metricas: pd.DataFrame, cv_metricas: pd.DataFrame, imp_rf: pd.DataFrame, coefs_log: pd.DataFrame, threshold: float, drop_cols: list[str]):
-    ganador = metricas.sort_values(["F1", "ROC_AUC", "Accuracy"], ascending=False).iloc[0]
-    ganador_cv = cv_metricas.sort_values(["CV_F1_Media", "CV_ROC_AUC_Media", "CV_Accuracy_Media"], ascending=False).iloc[0]
+def tabla_definiciones_variables(columnas_finales: list[str]):
+    filas = []
+    for variable in columnas_finales:
+        filas.append(
+            {
+                "Variable": variable,
+                "Definición": VARIABLE_DEFINITIONS.get(variable, "Variable derivada del pipeline de mercado."),
+            }
+        )
+    return pd.DataFrame(filas)
 
-    texto = []
-    texto.append(
-        f"El mejor modelo en el test fuera de muestra es **{ganador['Modelo']}**, con F1={ganador['F1']:.3f}, "
-        f"precision={ganador['Precision']:.3f}, recall={ganador['Recall']:.3f}, accuracy={ganador['Accuracy']:.3f} "
-        f"y ROC-AUC={ganador['ROC_AUC']:.3f}."
-    )
-    texto.append(
-        f"En validación temporal interna, el modelo más estable también es **{ganador_cv['Modelo']}**, "
-        f"con F1 medio={ganador_cv['CV_F1_Media']:.3f} y ROC-AUC medio={ganador_cv['CV_ROC_AUC_Media']:.3f}."
-    )
-    texto.append(
-        f"El umbral operativo actual es **{threshold:.2f}**. Eso hace la señal más conservadora que el umbral clásico 0,50 "
-        "y ayuda a evitar operar cuando la convicción del modelo es baja."
+
+def comentario_rendimiento(ganador):
+    if ganador["ROC_AUC"] < 0.55 or ganador["F1"] < 0.10:
+        return (
+            "La capacidad discriminativa del modelo es **muy limitada** en el test fuera de muestra. "
+            "Está muy cerca de un comportamiento aleatorio, así que debe presentarse como evidencia de las dificultades reales del problema, no como un sistema listo para operar."
+        )
+    if ganador["Precision"] >= 0.55 and ganador["Recall"] < 0.20:
+        return (
+            "El modelo tiene un perfil **muy conservador**: cuando lanza señal positiva suele filtrar bastante, pero detecta muy pocas subidas reales. "
+            "Eso suele ocurrir con umbrales exigentes o con probabilidades poco separadas."
+        )
+    if ganador["ROC_AUC"] >= 0.60 and ganador["F1"] >= 0.35:
+        return (
+            "El modelo muestra una señal **razonable** para una serie financiera ruidosa. No es una ventaja decisiva, pero sí puede servir como filtro táctico junto con otras reglas de control."
+        )
+    return (
+        "El modelo ofrece una señal **intermedia**: mejora ligeramente sobre una referencia aleatoria, pero su fortaleza no es estable ni suficientemente alta como para usarlo de forma aislada."
     )
 
+
+def comentario_estabilidad(ganador, ganador_cv):
+    gap_auc = abs(float(ganador["ROC_AUC"]) - float(ganador_cv["CV_ROC_AUC_Media"])) if pd.notna(ganador["ROC_AUC"]) else np.nan
+    gap_f1 = abs(float(ganador["F1"]) - float(ganador_cv["CV_F1_Media"])) if pd.notna(ganador["F1"]) else np.nan
+    if pd.notna(gap_auc) and pd.notna(gap_f1) and (gap_auc > 0.08 or gap_f1 > 0.15):
+        return (
+            "La diferencia entre test final y validación temporal interna sugiere **inestabilidad temporal**. "
+            "Eso encaja con la no estacionariedad del mercado y obliga a evitar conclusiones demasiado fuertes a partir de un solo tramo de prueba."
+        )
+    return (
+        "Las métricas de test y de validación temporal están **razonablemente alineadas**, lo que sugiere una señal más estable dentro del periodo analizado."
+    )
+
+
+def comentario_operativo(ganador, threshold: float):
+    if ganador["Pct_Predice_1"] < 0.05:
+        return (
+            f"Con un umbral operativo de **{threshold:.2f}**, el modelo apenas genera señales positivas. "
+            "Eso reduce operativa y drawdown, pero también puede hundir el recall y dejar escapar gran parte de los movimientos alcistas."
+        )
+    if threshold >= 0.60:
+        return (
+            f"El umbral operativo de **{threshold:.2f}** hace la estrategia más prudente que el estándar 0,50. "
+            "Es útil para filtrar ruido, aunque a cambio sacrifica sensibilidad ante subidas reales."
+        )
+    return (
+        f"El umbral operativo de **{threshold:.2f}** busca un equilibrio más cercano al estándar de clasificación. "
+        "Suele mejorar la sensibilidad, aunque también puede aumentar falsas señales."
+    )
+
+
+def comentario_variables(imp_rf: pd.DataFrame, coefs_log: pd.DataFrame):
     top_rf = ", ".join(imp_rf.head(5)["Variable"].tolist())
     top_log_pos = coefs_log[coefs_log["Coeficiente"] > 0].head(3)["Variable"].tolist()
     top_log_neg = coefs_log[coefs_log["Coeficiente"] < 0].head(3)["Variable"].tolist()
-    texto.append(
-        f"En Random Forest, las variables más influyentes son: {top_rf}. En la Regresión Logística, las variables con efecto positivo más claro "
-        f"sobre la probabilidad de subida son: {', '.join(top_log_pos) if top_log_pos else 'ninguna dominante'}; "
-        f"las que empujan hacia la clase de bajada son: {', '.join(top_log_neg) if top_log_neg else 'ninguna dominante'}."
+    return (
+        f"En Random Forest, las variables más influyentes son: **{top_rf}**. "
+        f"En la Regresión Logística, las variables con efecto positivo más claro sobre la probabilidad de subida son: **{', '.join(top_log_pos) if top_log_pos else 'ninguna dominante'}**; "
+        f"las que empujan hacia la clase de bajada son: **{', '.join(top_log_neg) if top_log_neg else 'ninguna dominante'}**."
     )
+
+
+def generar_interpretacion(metricas: pd.DataFrame, cv_metricas: pd.DataFrame, imp_rf: pd.DataFrame, coefs_log: pd.DataFrame, threshold: float, drop_cols: list[str], backtest_resumen: dict):
+    ganador = metricas.sort_values(["F1", "ROC_AUC", "Accuracy"], ascending=False).iloc[0]
+    ganador_cv = cv_metricas.loc[cv_metricas["Modelo"] == ganador["Modelo"]].iloc[0]
+
+    comentarios = [
+        f"El mejor modelo en el test fuera de muestra es **{ganador['Modelo']}**, con F1={ganador['F1']:.3f}, precision={ganador['Precision']:.3f}, recall={ganador['Recall']:.3f}, accuracy={ganador['Accuracy']:.3f} y ROC-AUC={ganador['ROC_AUC']:.3f}.",
+        comentario_rendimiento(ganador),
+        comentario_estabilidad(ganador, ganador_cv),
+        comentario_operativo(ganador, threshold),
+        comentario_variables(imp_rf, coefs_log),
+    ]
 
     if drop_cols:
-        texto.append(
-            f"El filtro de correlación ha eliminado {len(drop_cols)} variables redundantes: {', '.join(drop_cols)}. "
-            "Eso reduce ruido y riesgo de sobreajuste."
+        comentarios.append(
+            f"El filtro de correlación ha eliminado **{len(drop_cols)}** variables redundantes: **{', '.join(drop_cols)}**. Eso reduce ruido y riesgo de sobreajuste."
         )
 
-    texto.append(
-        "Desde una óptica financiera, el modelo debe interpretarse como una herramienta de apoyo táctico. "
-        "Puede ayudar a filtrar entradas, pero no sustituye la gestión del riesgo, los costes de transacción ni la validación continua fuera de muestra."
+    if backtest_resumen["Rentabilidad estrategia"] > backtest_resumen["Rentabilidad buy_hold"]:
+        comentarios.append(
+            "En el backtest simple, la estrategia basada en probabilidades supera a buy & hold en el periodo test. Es una señal interesante, aunque sigue siendo necesario incorporar costes de transacción y validación adicional."
+        )
+    else:
+        comentarios.append(
+            "En el backtest simple, la estrategia no supera a buy & hold en el periodo test. Por tanto, el modelo debe interpretarse como apoyo táctico o ejercicio académico, no como prueba de ventaja económica sostenible."
+        )
+
+    comentarios.append(
+        "Desde una óptica financiera, el modelo no sustituye la gestión del riesgo, los costes de transacción, el juicio del analista ni la validación continua fuera de muestra."
     )
-    return "\n\n".join(texto)
+    return "\n\n".join(comentarios)
+
+
+def ejecutar_analisis(params: dict):
+    ticker = params["ticker"]
+    benchmark = params["benchmark"]
+    usar_benchmark = params["usar_benchmark"]
+    inicio = params["inicio"]
+    fin = params["fin"]
+    train_pct = params["train_pct"]
+    threshold = params["threshold"]
+    aplicar_filtro_corr = params["aplicar_filtro_corr"]
+    threshold_corr = params["threshold_corr"]
+    optimizar = params["optimizar"]
+    cv_splits = params["cv_splits"]
+    frecuencia = params["frecuencia"]
+
+    interval = FREQUENCY_CONFIG[frecuencia]["interval"]
+    periods_per_year = FREQUENCY_CONFIG[frecuencia]["periods_per_year"]
+    activo, indice = descargar_datos(ticker, benchmark, str(inicio), str(fin), interval)
+
+    if activo.empty:
+        raise ValueError("No se han descargado datos para el ticker del activo. Revisa el símbolo introducido.")
+    if usar_benchmark and (indice is None or indice.empty):
+        raise ValueError("No se han descargado datos para el benchmark. Revisa el símbolo o desactiva el benchmark.")
+
+    data, columnas_features = preparar_dataset(activo, indice, usar_benchmark=usar_benchmark)
+    if len(data) < 180:
+        raise ValueError("Hay muy pocas observaciones tras construir las variables. Amplía el rango temporal o usa mayor frecuencia de datos.")
+
+    train, test = dividir_temporal(data, train_pct=train_pct)
+    X_train, y_train = train[columnas_features], train["target"]
+    X_test, y_test = test[columnas_features], test["target"]
+
+    X_train = X_train.replace([np.inf, -np.inf], np.nan)
+    X_test = X_test.replace([np.inf, -np.inf], np.nan)
+
+    dropped_features = []
+    if aplicar_filtro_corr:
+        X_train, X_test, columnas_finales, dropped_features = filtrar_por_correlacion(X_train, X_test, threshold=threshold_corr)
+    else:
+        columnas_finales = list(X_train.columns)
+
+    if len(columnas_finales) < 3:
+        raise ValueError("La selección de variables ha dejado muy pocas features. Sube el umbral de correlación o desactiva el filtro.")
+
+    logistic, rf = construir_modelos()
+    tscv = TimeSeriesSplit(n_splits=cv_splits)
+
+    mejores_params = []
+    if optimizar:
+        logistic, best_params_log, best_score_log = optimizar_modelo("Regresion Logistica", logistic, X_train, y_train, tscv)
+        rf, best_params_rf, best_score_rf = optimizar_modelo("Random Forest", rf, X_train, y_train, tscv)
+        mejores_params = [
+            {"Modelo": "Regresion Logistica", "Mejor ROC-AUC CV": best_score_log, "Parámetros": str(best_params_log)},
+            {"Modelo": "Random Forest", "Mejor ROC-AUC CV": best_score_rf, "Parámetros": str(best_params_rf)},
+        ]
+
+    cv_log = evaluar_cv("Regresion Logistica", logistic, X_train, y_train, tscv)
+    cv_rf = evaluar_cv("Random Forest", rf, X_train, y_train, tscv)
+    cv_metricas = pd.DataFrame([cv_log, cv_rf])
+
+    res_log = evaluar_modelo("Regresion Logistica", logistic, X_train, y_train, X_test, y_test, threshold=threshold)
+    res_rf = evaluar_modelo("Random Forest", rf, X_train, y_train, X_test, y_test, threshold=threshold)
+
+    metricas = pd.DataFrame(
+        [
+            {k: v for k, v in res_log.items() if k in ["Modelo", "Accuracy", "Precision", "Recall", "F1", "ROC_AUC", "Pct_Predice_1"]},
+            {k: v for k, v in res_rf.items() if k in ["Modelo", "Accuracy", "Precision", "Recall", "F1", "ROC_AUC", "Pct_Predice_1"]},
+        ]
+    )
+
+    imp_rf = importancia_random_forest(res_rf["ModeloEntrenado"], columnas_finales)
+    coefs_log = coeficientes_logistic(res_log["ModeloEntrenado"], columnas_finales)
+
+    pred_log = preparar_predicciones_test(test, res_log)
+    pred_rf = preparar_predicciones_test(test, res_rf)
+
+    mejor_modelo_nombre = metricas.sort_values(["F1", "ROC_AUC", "Accuracy"], ascending=False).iloc[0]["Modelo"]
+    pred_mejor = pred_log if mejor_modelo_nombre == "Regresion Logistica" else pred_rf
+    backtest_resumen = resumir_backtest(pred_mejor, periods_per_year=periods_per_year)
+    interpretacion = generar_interpretacion(metricas, cv_metricas, imp_rf, coefs_log, threshold, dropped_features, backtest_resumen)
+
+    resumen = pd.DataFrame(
+        {
+            "Activo": [ticker],
+            "Benchmark": [benchmark if usar_benchmark else "No usado"],
+            "Frecuencia": [frecuencia],
+            "Periodo": [f"{data.index.min().date()} a {data.index.max().date()}"],
+            "Pct clase 1 (sube)": [round(data["target"].mean() * 100, 2)],
+            "Pct clase 0 (baja)": [round((1 - data["target"].mean()) * 100, 2)],
+            "Pct clase 1 en test": [round(test["target"].mean() * 100, 2)],
+            "Fecha inicio test": [test.index.min().date()],
+            "Fecha fin test": [test.index.max().date()],
+        }
+    )
+
+    balance = pd.DataFrame(
+        {
+            "Clase": ["0 = no sube", "1 = sube"],
+            "Observaciones": [int((data["target"] == 0).sum()), int((data["target"] == 1).sum())],
+        }
+    )
+
+    definiciones_variables = tabla_definiciones_variables(columnas_finales)
+    export_metricas = metricas.merge(cv_metricas, on="Modelo", how="left")
+
+    return {
+        "params": params,
+        "data": data,
+        "indice": indice,
+        "train": train,
+        "test": test,
+        "columnas_finales": columnas_finales,
+        "dropped_features": dropped_features,
+        "metricas": metricas,
+        "cv_metricas": cv_metricas,
+        "mejores_params": mejores_params,
+        "res_log": res_log,
+        "res_rf": res_rf,
+        "imp_rf": imp_rf,
+        "coefs_log": coefs_log,
+        "pred_log": pred_log,
+        "pred_rf": pred_rf,
+        "mejor_modelo_nombre": mejor_modelo_nombre,
+        "pred_mejor": pred_mejor,
+        "backtest_resumen": backtest_resumen,
+        "interpretacion": interpretacion,
+        "resumen": resumen,
+        "balance": balance,
+        "definiciones_variables": definiciones_variables,
+        "export_metricas": export_metricas,
+        "periods_per_year": periods_per_year,
+    }
 
 
 st.title("Actividad 2 - Aprendizaje supervisado: clasificacion")
@@ -478,210 +730,200 @@ st.markdown(
     "App para descargar datos de mercado, construir variables técnicas, aplicar selección de características y comparar **Regresión Logística** y **Random Forest** con validación temporal."
 )
 
+if "analysis_results" not in st.session_state:
+    st.session_state.analysis_results = None
+
 with st.sidebar:
     st.header("Parámetros")
     ticker = st.text_input("Ticker del activo", value="SAN.MC")
+    frecuencia = st.selectbox("Frecuencia de los datos", options=list(FREQUENCY_CONFIG.keys()), index=0)
     usar_benchmark = st.checkbox("Usar benchmark", value=True)
     benchmark = st.text_input("Ticker del índice de referencia", value="^IBEX") if usar_benchmark else None
     inicio = st.date_input("Fecha inicio", value=date(2018, 1, 1))
     fin = st.date_input("Fecha fin", value=date(2025, 12, 31))
     train_pct = st.slider("Porcentaje para entrenamiento", min_value=0.60, max_value=0.90, value=0.80, step=0.05)
-    threshold = st.slider("Umbral para señal positiva", min_value=0.50, max_value=0.80, value=0.60, step=0.01)
+    threshold = st.slider("Umbral para señal positiva", min_value=0.50, max_value=0.80, value=0.55, step=0.01)
     aplicar_filtro_corr = st.checkbox("Aplicar filtro de correlación", value=True)
     threshold_corr = st.slider("Umbral de correlación", min_value=0.80, max_value=0.99, value=0.95, step=0.01)
-    optimizar = st.checkbox("Optimizar hiperparámetros", value=True)
+    optimizar = st.checkbox(
+        "Optimizar hiperparámetros",
+        value=False,
+        help="Prueba varias configuraciones internas del modelo para maximizar ROC-AUC en validación temporal. Puede tardar bastante y no garantiza mejorar F1 con el umbral elegido.",
+    )
     cv_splits = st.slider("Splits TimeSeriesSplit", min_value=3, max_value=6, value=4, step=1)
     ejecutar = st.button("Ejecutar análisis", type="primary")
+
+params = {
+    "ticker": ticker,
+    "frecuencia": frecuencia,
+    "usar_benchmark": usar_benchmark,
+    "benchmark": benchmark,
+    "inicio": inicio,
+    "fin": fin,
+    "train_pct": train_pct,
+    "threshold": threshold,
+    "aplicar_filtro_corr": aplicar_filtro_corr,
+    "threshold_corr": threshold_corr,
+    "optimizar": optimizar,
+    "cv_splits": cv_splits,
+}
 
 st.info(
     "La variable objetivo es binaria: **1** si la rentabilidad del siguiente periodo es positiva y **0** si es negativa o cero. El modelo operativo usa un enfoque **long/cash**: entra si la probabilidad de subida supera el umbral y se queda fuera en caso contrario."
 )
 
+st.caption(
+    "Nota: las medias móviles, RSI, volatilidad y demás indicadores se calculan en la frecuencia seleccionada. Por ejemplo, en frecuencia semanal, 5 periodos equivalen a 5 semanas."
+)
+
 if ejecutar:
     try:
-        activo, indice = descargar_datos(ticker, benchmark, str(inicio), str(fin))
+        with st.spinner("Descargando datos y ejecutando el análisis..."):
+            st.session_state.analysis_results = ejecutar_analisis(params)
+    except Exception as e:
+        st.session_state.analysis_results = None
+        st.exception(e)
 
-        if activo.empty:
-            st.error("No se han descargado datos para el ticker del activo. Revisa el símbolo introducido.")
-            st.stop()
-        if usar_benchmark and (indice is None or indice.empty):
-            st.error("No se han descargado datos para el benchmark. Revisa el símbolo o desactiva el benchmark.")
-            st.stop()
+results = st.session_state.analysis_results
 
-        data, columnas_features = preparar_dataset(activo, indice, usar_benchmark=usar_benchmark)
+if results is not None:
+    data = results["data"]
+    indice = results["indice"]
+    train = results["train"]
+    test = results["test"]
+    columnas_finales = results["columnas_finales"]
+    dropped_features = results["dropped_features"]
+    metricas = results["metricas"]
+    cv_metricas = results["cv_metricas"]
+    mejores_params = results["mejores_params"]
+    res_log = results["res_log"]
+    res_rf = results["res_rf"]
+    imp_rf = results["imp_rf"]
+    coefs_log = results["coefs_log"]
+    pred_log = results["pred_log"]
+    pred_rf = results["pred_rf"]
+    mejor_modelo_nombre = results["mejor_modelo_nombre"]
+    pred_mejor = results["pred_mejor"]
+    backtest_resumen = results["backtest_resumen"]
+    interpretacion = results["interpretacion"]
+    resumen = results["resumen"]
+    balance = results["balance"]
+    definiciones_variables = results["definiciones_variables"]
+    export_metricas = results["export_metricas"]
 
-        if len(data) < 180:
-            st.error("Hay muy pocas observaciones tras construir las variables. Amplía el rango temporal.")
-            st.stop()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Observaciones totales", len(data))
+    c2.metric("Train", len(train))
+    c3.metric("Test", len(test))
+    c4.metric("Features finales", len(columnas_finales))
 
-        train, test = dividir_temporal(data, train_pct=train_pct)
-        X_train, y_train = train[columnas_features], train["target"]
-        X_test, y_test = test[columnas_features], test["target"]
+    st.subheader("Resumen de datos")
+    st.dataframe(resumen, use_container_width=True)
 
-        X_train = X_train.replace([np.inf, -np.inf], np.nan)
-        X_test = X_test.replace([np.inf, -np.inf], np.nan)
+    st.subheader("Balance de clases")
+    fig_balance = go.Figure(data=[go.Bar(x=balance["Clase"], y=balance["Observaciones"], text=balance["Observaciones"], textposition="outside")])
+    fig_balance.update_layout(height=350)
+    st.plotly_chart(fig_balance, use_container_width=True)
 
-        dropped_features = []
-        if aplicar_filtro_corr:
-            X_train, X_test, columnas_finales, dropped_features = filtrar_por_correlacion(X_train, X_test, threshold=threshold_corr)
+    st.subheader("Gráfico interactivo del activo")
+    st.plotly_chart(grafico_precio(data, ticker, indice if usar_benchmark else None, benchmark), use_container_width=True)
+
+    st.subheader("Selección de variables")
+    cols_fs1, cols_fs2 = st.columns([2, 1])
+    with cols_fs1:
+        st.dataframe(pd.DataFrame({"Variables finales": columnas_finales}), use_container_width=True)
+    with cols_fs2:
+        if dropped_features:
+            st.dataframe(pd.DataFrame({"Variables eliminadas": dropped_features}), use_container_width=True)
         else:
-            columnas_finales = list(X_train.columns)
+            st.success("No se eliminaron variables por correlación.")
 
-        if len(columnas_finales) < 3:
-            st.error("La selección de variables ha dejado muy pocas features. Sube el umbral de correlación o desactiva el filtro.")
-            st.stop()
+    st.subheader("Definición corta de las variables seleccionadas")
+    st.dataframe(definiciones_variables, use_container_width=True, hide_index=True)
 
-        logistic, rf = construir_modelos()
-        tscv = TimeSeriesSplit(n_splits=cv_splits)
-
-        mejores_params = []
-        if optimizar:
-            with st.spinner("Optimizando hiperparámetros..."):
-                logistic, best_params_log, best_score_log = optimizar_modelo("Regresion Logistica", logistic, X_train, y_train, tscv)
-                rf, best_params_rf, best_score_rf = optimizar_modelo("Random Forest", rf, X_train, y_train, tscv)
-                mejores_params = [
-                    {"Modelo": "Regresion Logistica", "Mejor ROC-AUC CV": best_score_log, "Parámetros": str(best_params_log)},
-                    {"Modelo": "Random Forest", "Mejor ROC-AUC CV": best_score_rf, "Parámetros": str(best_params_rf)},
-                ]
-
-        cv_log = evaluar_cv("Regresion Logistica", logistic, X_train, y_train, tscv)
-        cv_rf = evaluar_cv("Random Forest", rf, X_train, y_train, tscv)
-        cv_metricas = pd.DataFrame([cv_log, cv_rf])
-
-        res_log = evaluar_modelo("Regresion Logistica", logistic, X_train, y_train, X_test, y_test, threshold=threshold)
-        res_rf = evaluar_modelo("Random Forest", rf, X_train, y_train, X_test, y_test, threshold=threshold)
-
-        metricas = pd.DataFrame(
-            [
-                {k: v for k, v in res_log.items() if k in ["Modelo", "Accuracy", "Precision", "Recall", "F1", "ROC_AUC"]},
-                {k: v for k, v in res_rf.items() if k in ["Modelo", "Accuracy", "Precision", "Recall", "F1", "ROC_AUC"]},
-            ]
-        )
-
-        imp_rf = importancia_random_forest(res_rf["ModeloEntrenado"], columnas_finales)
-        coefs_log = coeficientes_logistic(res_log["ModeloEntrenado"], columnas_finales)
-        interpretacion = generar_interpretacion(metricas, cv_metricas, imp_rf, coefs_log, threshold, dropped_features)
-
-        pred_log = preparar_predicciones_test(test, res_log)
-        pred_rf = preparar_predicciones_test(test, res_rf)
-
-        mejor_modelo_nombre = metricas.sort_values(["F1", "ROC_AUC", "Accuracy"], ascending=False).iloc[0]["Modelo"]
-        pred_mejor = pred_log if mejor_modelo_nombre == "Regresion Logistica" else pred_rf
-        backtest_resumen = resumir_backtest(pred_mejor)
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Observaciones totales", len(data))
-        c2.metric("Train", len(train))
-        c3.metric("Test", len(test))
-        c4.metric("Features finales", len(columnas_finales))
-
-        st.subheader("Resumen de datos")
-        resumen = pd.DataFrame(
+    st.subheader("Métricas de validación en test")
+    st.dataframe(
+        metricas.style.format(
             {
-                "Activo": [ticker],
-                "Benchmark": [benchmark if usar_benchmark else "No usado"],
-                "Periodo": [f"{data.index.min().date()} a {data.index.max().date()}"],
-                "Pct clase 1 (sube)": [round(data["target"].mean() * 100, 2)],
-                "Pct clase 0 (baja)": [round((1 - data["target"].mean()) * 100, 2)],
-                "Fecha inicio test": [test.index.min().date()],
-                "Fecha fin test": [test.index.max().date()],
+                "Accuracy": "{:.3f}",
+                "Precision": "{:.3f}",
+                "Recall": "{:.3f}",
+                "F1": "{:.3f}",
+                "ROC_AUC": "{:.3f}",
+                "Pct_Predice_1": "{:.1%}",
             }
-        )
-        st.dataframe(resumen, use_container_width=True)
+        ),
+        use_container_width=True,
+    )
 
-        st.subheader("Balance de clases")
-        balance = pd.DataFrame(
+    st.subheader("Validación temporal (TimeSeriesSplit)")
+    st.dataframe(
+        cv_metricas.style.format(
             {
-                "Clase": ["0 = no sube", "1 = sube"],
-                "Observaciones": [int((data["target"] == 0).sum()), int((data["target"] == 1).sum())],
+                "CV_Accuracy_Media": "{:.3f}",
+                "CV_Accuracy_STD": "{:.3f}",
+                "CV_Precision_Media": "{:.3f}",
+                "CV_Recall_Media": "{:.3f}",
+                "CV_F1_Media": "{:.3f}",
+                "CV_ROC_AUC_Media": "{:.3f}",
             }
-        )
-        fig_balance = go.Figure(data=[go.Bar(x=balance["Clase"], y=balance["Observaciones"], text=balance["Observaciones"], textposition="outside")])
-        fig_balance.update_layout(height=350)
-        st.plotly_chart(fig_balance, use_container_width=True)
+        ),
+        use_container_width=True,
+    )
 
-        st.subheader("Gráfico interactivo del activo")
-        st.plotly_chart(grafico_precio(data, ticker, indice if usar_benchmark else None, benchmark), use_container_width=True)
+    if mejores_params:
+        st.subheader("Optimización de hiperparámetros")
+        st.dataframe(pd.DataFrame(mejores_params), use_container_width=True)
 
-        st.subheader("Selección de variables")
-        cols_fs1, cols_fs2 = st.columns([2, 1])
-        with cols_fs1:
-            st.dataframe(pd.DataFrame({"Variables finales": columnas_finales}), use_container_width=True)
-        with cols_fs2:
-            if dropped_features:
-                st.dataframe(pd.DataFrame({"Variables eliminadas": dropped_features}), use_container_width=True)
-            else:
-                st.success("No se eliminaron variables por correlación.")
+    st.subheader("Matrices de confusión")
+    col_conf1, col_conf2 = st.columns(2)
+    with col_conf1:
+        st.plotly_chart(grafico_matriz_confusion(res_log["Matriz"], "Regresión Logística"), use_container_width=True)
+    with col_conf2:
+        st.plotly_chart(grafico_matriz_confusion(res_rf["Matriz"], "Random Forest"), use_container_width=True)
 
-        st.subheader("Métricas de validación en test")
-        st.dataframe(
-            metricas.style.format(
-                {
-                    "Accuracy": "{:.3f}",
-                    "Precision": "{:.3f}",
-                    "Recall": "{:.3f}",
-                    "F1": "{:.3f}",
-                    "ROC_AUC": "{:.3f}",
-                }
-            ),
-            use_container_width=True,
-        )
+    st.caption(
+        "Consejo de lectura: si la columna 'Predice 1' sale muy baja, el modelo está lanzando muy pocas señales alcistas. Suele deberse a un umbral alto o a probabilidades poco separadas."
+    )
 
-        st.subheader("Validación temporal (TimeSeriesSplit)")
-        st.dataframe(
-            cv_metricas.style.format(
-                {
-                    "CV_Accuracy_Media": "{:.3f}",
-                    "CV_Accuracy_STD": "{:.3f}",
-                    "CV_Precision_Media": "{:.3f}",
-                    "CV_Recall_Media": "{:.3f}",
-                    "CV_F1_Media": "{:.3f}",
-                    "CV_ROC_AUC_Media": "{:.3f}",
-                }
-            ),
-            use_container_width=True,
-        )
+    st.subheader("Curva ROC")
+    st.plotly_chart(grafico_roc(res_log, res_rf), use_container_width=True)
 
-        if mejores_params:
-            st.subheader("Optimización de hiperparámetros")
-            st.dataframe(pd.DataFrame(mejores_params), use_container_width=True)
+    st.subheader("Probabilidad predicha vs resultado real")
+    modelo_vista = st.radio(
+        "Modelo para visualizar",
+        options=["Regresion Logistica", "Random Forest"],
+        horizontal=True,
+        key="modelo_vista_probabilidades",
+    )
+    pred_vista = pred_log if modelo_vista == "Regresion Logistica" else pred_rf
+    st.plotly_chart(grafico_probabilidad_vs_real(pred_vista, threshold, modelo_vista), use_container_width=True)
 
-        st.subheader("Matrices de confusión")
-        col_conf1, col_conf2 = st.columns(2)
-        with col_conf1:
-            st.plotly_chart(grafico_matriz_confusion(res_log["Matriz"], "Regresión Logística"), use_container_width=True)
-        with col_conf2:
-            st.plotly_chart(grafico_matriz_confusion(res_rf["Matriz"], "Random Forest"), use_container_width=True)
+    st.subheader("Distribución de probabilidades predichas")
+    st.plotly_chart(grafico_distribucion_probabilidades(pred_log, pred_rf), use_container_width=True)
 
-        st.subheader("Curva ROC")
-        st.plotly_chart(grafico_roc(res_log, res_rf), use_container_width=True)
+    st.subheader("Importancia de variables y coeficientes")
+    st.plotly_chart(grafico_importancias(imp_rf, coefs_log), use_container_width=True)
 
-        st.subheader("Probabilidad predicha vs resultado real")
-        modelo_vista = st.radio("Modelo para visualizar", options=["Regresion Logistica", "Random Forest"], horizontal=True)
-        pred_vista = pred_log if modelo_vista == "Regresion Logistica" else pred_rf
-        st.plotly_chart(grafico_probabilidad_vs_real(pred_vista, threshold, modelo_vista), use_container_width=True)
+    st.subheader("Backtest simple")
+    bt_col1, bt_col2, bt_col3, bt_col4, bt_col5 = st.columns(5)
+    bt_col1.metric("Modelo usado", mejor_modelo_nombre)
+    bt_col2.metric("Rent. estrategia", f"{backtest_resumen['Rentabilidad estrategia'] * 100:.2f}%")
+    bt_col3.metric("Rent. buy&hold", f"{backtest_resumen['Rentabilidad buy_hold'] * 100:.2f}%")
+    bt_col4.metric("Sharpe simple", f"{backtest_resumen['Sharpe simple']:.2f}" if pd.notna(backtest_resumen['Sharpe simple']) else "n.d.")
+    bt_col5.metric("Max drawdown", f"{backtest_resumen['Max drawdown'] * 100:.2f}%")
+    st.caption(f"Porcentaje de periodos invertido: {backtest_resumen['Pct periodos invertido']:.1%}")
+    st.plotly_chart(grafico_backtest(pred_mejor, mejor_modelo_nombre), use_container_width=True)
 
-        st.subheader("Importancia de variables y coeficientes")
-        st.plotly_chart(grafico_importancias(imp_rf, coefs_log), use_container_width=True)
+    st.subheader("Interpretación automática")
+    st.write(interpretacion)
 
-        st.subheader("Backtest simple")
-        bt_col1, bt_col2, bt_col3, bt_col4, bt_col5 = st.columns(5)
-        bt_col1.metric("Modelo usado", mejor_modelo_nombre)
-        bt_col2.metric("Rent. estrategia", f"{backtest_resumen['Rentabilidad estrategia'] * 100:.2f}%")
-        bt_col3.metric("Rent. buy&hold", f"{backtest_resumen['Rentabilidad buy_hold'] * 100:.2f}%")
-        bt_col4.metric("Sharpe simple", f"{backtest_resumen['Sharpe simple']:.2f}" if pd.notna(backtest_resumen['Sharpe simple']) else "n.d.")
-        bt_col5.metric("Max drawdown", f"{backtest_resumen['Max drawdown'] * 100:.2f}%")
-
-        st.plotly_chart(grafico_backtest(pred_mejor, mejor_modelo_nombre), use_container_width=True)
-
-        st.subheader("Interpretación automática")
-        st.write(interpretacion)
-
-        st.subheader("Anexo técnico para el informe")
-        st.markdown(
-            f"""
+    st.subheader("Anexo técnico para el informe")
+    st.markdown(
+        f"""
 - **Activo analizado:** `{ticker}`
 - **Benchmark:** `{benchmark if usar_benchmark else 'No utilizado'}`
+- **Frecuencia de trabajo:** `{frecuencia}`.
 - **Variable objetivo:** 1 si la rentabilidad de `t+1` es positiva; 0 si es negativa o cero.
 - **Separación temporal:** {int(train_pct * 100)}% entrenamiento / {int((1 - train_pct) * 100)}% prueba.
 - **Validación interna:** TimeSeriesSplit con {cv_splits} particiones.
@@ -690,32 +932,28 @@ if ejecutar:
 - **Selección de variables:** {'Sí, filtro de correlación' if aplicar_filtro_corr else 'No aplicada'}.
 - **Optimización de hiperparámetros:** {'Sí' if optimizar else 'No'}.
 - **Variables explicativas usadas:** {', '.join(columnas_finales)}.
-            """
-        )
+        """
+    )
 
-        export_metricas = metricas.merge(cv_metricas, on="Modelo", how="left")
-        export_metricas.to_csv(index=False).encode("utf-8")
+    csv_metricas = export_metricas.to_csv(index=False).encode("utf-8")
+    csv_pred_mejor = pred_mejor.reset_index().rename(columns={"index": "Date"}).to_csv(index=False).encode("utf-8")
+    csv_imp = imp_rf.to_csv(index=False).encode("utf-8")
+    csv_coef = coefs_log.to_csv(index=False).encode("utf-8")
+    csv_defs = definiciones_variables.to_csv(index=False).encode("utf-8")
 
-        csv_metricas = export_metricas.to_csv(index=False).encode("utf-8")
-        csv_pred_mejor = pred_mejor.reset_index().rename(columns={"index": "Date"}).to_csv(index=False).encode("utf-8")
-        csv_imp = imp_rf.to_csv(index=False).encode("utf-8")
-        csv_coef = coefs_log.to_csv(index=False).encode("utf-8")
-
-        dl1, dl2, dl3, dl4 = st.columns(4)
-        dl1.download_button("Descargar métricas CSV", csv_metricas, file_name="metricas_modelos.csv", mime="text/csv")
-        dl2.download_button("Descargar predicciones CSV", csv_pred_mejor, file_name="predicciones_mejor_modelo.csv", mime="text/csv")
-        dl3.download_button("Descargar importancias RF", csv_imp, file_name="importancias_random_forest.csv", mime="text/csv")
-        dl4.download_button("Descargar coeficientes logit", csv_coef, file_name="coeficientes_logistica.csv", mime="text/csv")
-
-    except Exception as e:
-        st.exception(e)
+    dl1, dl2, dl3, dl4, dl5 = st.columns(5)
+    dl1.download_button("Descargar métricas CSV", csv_metricas, file_name="metricas_modelos.csv", mime="text/csv")
+    dl2.download_button("Descargar predicciones CSV", csv_pred_mejor, file_name="predicciones_mejor_modelo.csv", mime="text/csv")
+    dl3.download_button("Descargar importancias RF", csv_imp, file_name="importancias_random_forest.csv", mime="text/csv")
+    dl4.download_button("Descargar coeficientes logit", csv_coef, file_name="coeficientes_logistica.csv", mime="text/csv")
+    dl5.download_button("Descargar definiciones variables", csv_defs, file_name="definiciones_variables.csv", mime="text/csv")
 else:
     st.markdown(
         """
 ### Recomendación de uso
-1. Ejecuta varios tickers del IBEX 35 o del mercado que elijas.
-2. Compara métricas, curva ROC e interpretación de variables.
-3. Usa la gráfica de probabilidad predicha vs resultado real para explicar cuándo el modelo acierta o se equivoca.
-4. Usa el backtest simple solo como apoyo ilustrativo, no como prueba definitiva de rentabilidad.
+1. Prueba varios tickers y varias frecuencias para comparar estabilidad.
+2. Empieza con umbral 0.55 y optimización desactivada; después prueba variantes.
+3. Si la columna `Predice 1` es muy baja, revisa el umbral o la separación temporal.
+4. Usa la gráfica de probabilidad predicha vs resultado real para explicar cuándo el modelo acierta o se equivoca.
         """
     )
