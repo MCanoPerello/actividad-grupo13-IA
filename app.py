@@ -942,10 +942,10 @@ if results is not None:
     csv_defs = definiciones_variables.to_csv(index=False).encode("utf-8")
 
     dl1, dl2, dl3, dl4, dl5 = st.columns(5)
-    dl1.download_button("Descargar métricas CSV", csv_metricas, file_name="metricas_modelos.csv", mime="text/csv")
-    dl2.download_button("Descargar predicciones CSV", csv_pred_mejor, file_name="predicciones_mejor_modelo.csv", mime="text/csv")
+    dl1.download_button("Descargar métricas", csv_metricas, file_name="metricas_modelos.csv", mime="text/csv")
+    dl2.download_button("Descargar predicciones", csv_pred_mejor, file_name="predicciones_mejor_modelo.csv", mime="text/csv")
     dl3.download_button("Descargar importancias RF", csv_imp, file_name="importancias_random_forest.csv", mime="text/csv")
-    dl4.download_button("Descargar coeficientes logit", csv_coef, file_name="coeficientes_logistica.csv", mime="text/csv")
+    dl4.download_button("Descargar coeficientes variables", csv_coef, file_name="coeficientes_logistica.csv", mime="text/csv")
     dl5.download_button("Descargar definiciones variables", csv_defs, file_name="definiciones_variables.csv", mime="text/csv")
 else:
     st.markdown(
